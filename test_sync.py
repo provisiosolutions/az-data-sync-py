@@ -6,6 +6,7 @@ Run:  py -3 -m pytest test_sync.py -v
 """
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -284,3 +285,48 @@ class TestSyncContainer:
         stats2 = sync_container(client, tmp_path)
         assert stats2["downloaded"] == 0
         assert stats2["skipped"] == 1
+
+
+# ===========================================================================
+# Security
+# ===========================================================================
+
+class TestSecurity:
+    def test_directory_traversal_blocked(self, tmp_path, caplog):
+        # A blob with path traversal chars
+        blob = make_blob("../outside.txt")
+        client = make_container_client([blob])
+
+        with caplog.at_level(logging.WARNING):
+            stats = sync_container(client, tmp_path)
+
+        assert stats["downloaded"] == 0
+        assert stats["skipped"] == 1
+        assert "SECURITY: Path escapes local directory" in caplog.text
+        assert not (tmp_path.parent / "outside.txt").exists()
+
+    def test_absolute_path_blocked(self, tmp_path, caplog):
+        # A blob attempting to write to root/absolute path
+        import os
+        blob = make_blob("/etc/passwd" if os.name != "nt" else "C:\\Windows\\System32\\evil.dll")
+        client = make_container_client([blob])
+
+        with caplog.at_level(logging.WARNING):
+            stats = sync_container(client, tmp_path)
+
+        assert stats["downloaded"] == 0
+        assert stats["skipped"] == 1
+        assert "SECURITY: Path escapes local directory" in caplog.text
+
+    def test_max_size_enforced(self, tmp_path, caplog):
+        # A 100-byte blob
+        blob = make_blob("huge.txt", size=100)
+        client = make_container_client([blob])
+
+        # Set max size to 50 bytes
+        with caplog.at_level(logging.WARNING):
+            stats = sync_container(client, tmp_path, max_size_bytes=50)
+
+        assert stats["downloaded"] == 0
+        assert stats["skipped"] == 1
+        assert "SECURITY: Exceeds max size limit" in caplog.text

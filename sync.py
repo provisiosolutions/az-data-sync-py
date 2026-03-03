@@ -32,15 +32,26 @@ from pathlib import Path
 from azure.storage.blob import BlobServiceClient, ContainerClient
 
 
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, BarColumn, TextColumn
+from rich.panel import Panel
+from rich.table import Table
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(rich_tracebacks=True, markup=True)]
 )
 log = logging.getLogger("azure-sync")
+# Suppress noisy azure SDK
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+console = Console()
 
 # ---------------------------------------------------------------------------
 # Manifest helpers (tracks what we already have locally)
@@ -93,7 +104,7 @@ def _download_blob(container_client: ContainerClient, blob_name: str, dest_path:
     """Worker function to download a single blob from Azure."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     blob_client = container_client.get_blob_client(blob_name)
-    log.info("DOWN  %s → %s", blob_name, dest_path)
+    log.debug("DOWN  %s", blob_name)
 
     with open(dest_path, "wb") as f:
         stream = blob_client.download_blob()
@@ -106,6 +117,7 @@ def sync_container(
     prefix: str = "",
     delete_orphaned: bool = False,
     max_workers: int = 8,
+    max_size_bytes: int = 50 * 1024**3,
 ) -> dict:
     """
     One-way sync: Azure Blob → local filesystem using concurrent workers.
@@ -126,11 +138,26 @@ def sync_container(
     # Determine actions needed: (blobs to skip, blobs to download)
     to_download = []
     
+    resolved_local_dir = local_dir.resolve()
+
     for blob in blobs:
         blob_name: str = blob.name
         
         # Skip "directory" markers (zero-byte blobs ending with /)
         if blob_name.endswith("/"):
+            continue
+
+        # SECURITY: Check for directory traversal / escape attacks
+        dest_path = (local_dir / blob_name).resolve()
+        if not dest_path.is_relative_to(resolved_local_dir):
+            log.warning("SKIP  %s  (SECURITY: Path escapes local directory)", blob_name)
+            stats["skipped"] += 1
+            continue
+
+        # SECURITY: Check size limits
+        if blob.size and blob.size > max_size_bytes:
+            log.warning("SKIP  %s  (SECURITY: Exceeds max size limit of %d bytes)", blob_name, max_size_bytes)
+            stats["skipped"] += 1
             continue
 
         entry = manifest.get(blob_name)
@@ -142,43 +169,55 @@ def sync_container(
         else:
             to_download.append((blob, entry))
 
-    # Process downloads concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all download tasks
-        future_to_blob = {
-            executor.submit(
-                _download_blob, container_client, blob.name, local_dir / blob.name
-            ): (blob, entry)
-            for blob, entry in to_download
-        }
+    if to_download:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("[cyan]Downloading files...", total=len(to_download))
 
-        # Handle results as they complete
-        for future in concurrent.futures.as_completed(future_to_blob):
-            blob, entry = future_to_blob[future]
-            blob_name = blob.name
-            
-            try:
-                future.result()  # Will raise if _download_blob threw an exception
-                new_manifest[blob_name] = {
-                    "etag": blob.etag,
-                    "last_modified": blob.last_modified.isoformat() if blob.last_modified else None,
-                    "size": blob.size,
-                    "synced_at": datetime.now(timezone.utc).isoformat(),
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all download tasks
+                future_to_blob = {
+                    executor.submit(
+                        _download_blob, container_client, blob.name, local_dir / blob.name
+                    ): (blob, entry)
+                    for blob, entry in to_download
                 }
-                stats["downloaded"] += 1
-            except Exception as exc:
-                log.error("FAIL  %s  → %s", blob_name, exc)
-                # Keep the old manifest entry so we retry next run
-                if entry:
-                    new_manifest[blob_name] = entry
-                stats["errors"] += 1
+
+                # Handle results as they complete
+                for future in concurrent.futures.as_completed(future_to_blob):
+                    blob, entry = future_to_blob[future]
+                    blob_name = blob.name
+                    
+                    try:
+                        future.result()  # Will raise if _download_blob threw an exception
+                        new_manifest[blob_name] = {
+                            "etag": blob.etag,
+                            "last_modified": blob.last_modified.isoformat() if blob.last_modified else None,
+                            "size": blob.size,
+                            "synced_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        stats["downloaded"] += 1
+                    except Exception as exc:
+                        log.error("FAIL  %s  → %s", blob_name, exc)
+                        # Keep the old manifest entry so we retry next run
+                        if entry:
+                            new_manifest[blob_name] = entry
+                        stats["errors"] += 1
+                    
+                    progress.advance(task_id)
 
     # Optionally remove local files that no longer exist in the container
     if delete_orphaned:
         orphaned = set(manifest.keys()) - set(new_manifest.keys())
         for orphan in orphaned:
-            orphan_path = local_dir / orphan
-            if orphan_path.exists():
+            orphan_path = (local_dir / orphan).resolve()
+            if orphan_path.is_relative_to(resolved_local_dir) and orphan_path.exists():
                 log.info("DEL   %s  (orphaned)", orphan)
                 orphan_path.unlink()
                 stats["deleted"] += 1
@@ -248,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of concurrent download threads to use. Default is 8.",
     )
     p.add_argument(
+        "--max-size-gb",
+        type=float,
+        default=50.0,
+        help="Maximum allowed file size in GB. Larger files are skipped. Default is 50.0.",
+    )
+    p.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug-level logging for detailed troubleshooting.",
@@ -284,6 +329,7 @@ def main() -> None:
     prefix = args.prefix or cfg.get("prefix", "")
     delete_orphaned = args.delete_orphaned or cfg.get("delete_orphaned", False)
     workers = getattr(args, "workers", cfg.get("workers", 8))
+    max_size_gb = getattr(args, "max_size_gb", cfg.get("max_size_gb", 50.0))
 
     if not connection_string:
         log.error("No connection string provided. Use --connection-string, config file, or AZURE_STORAGE_CONNECTION_STRING env var.")
@@ -297,11 +343,16 @@ def main() -> None:
     log.info("Container : %s", container_name)
     log.info("Local dir : %s", local_dir.resolve())
     log.info("Workers   : %d", workers)
+    log.info("Size Limit: %.1f GB", max_size_gb)
 
-    if connection_string.startswith("http://") or connection_string.startswith("https://"):
-        blob_service = BlobServiceClient(account_url=connection_string)
-    else:
-        blob_service = BlobServiceClient.from_connection_string(connection_string)
+    try:
+        if connection_string.startswith("http://") or connection_string.startswith("https://"):
+            blob_service = BlobServiceClient(account_url=connection_string)
+        else:
+            blob_service = BlobServiceClient.from_connection_string(connection_string)
+    except Exception as exc:
+        log.error("Failed to connect to Azure or parse connection string. Please verify your configuration.")
+        sys.exit(1)
         
     container_client = blob_service.get_container_client(container_name)
 
@@ -311,14 +362,21 @@ def main() -> None:
         prefix=prefix,
         delete_orphaned=delete_orphaned,
         max_workers=workers,
+        max_size_bytes=int(max_size_gb * 1024**3),
     )
 
     # ── Summary ─────────────────────────────────────────────────
-    log.info("── Sync complete ──────────────────────────────────")
-    log.info("  Downloaded : %d", stats["downloaded"])
-    log.info("  Skipped    : %d", stats["skipped"])
-    log.info("  Deleted    : %d", stats["deleted"])
-    log.info("  Errors     : %d", stats["errors"])
+    table = Table(title="Sync Complete")
+    table.add_column("Action", style="cyan")
+    table.add_column("Count", justify="right", style="green")
+
+    table.add_row("Downloaded", str(stats["downloaded"]))
+    table.add_row("Skipped", str(stats["skipped"]))
+    table.add_row("Deleted", str(stats["deleted"]))
+    table.add_row("Errors", f"[red]{stats['errors']}[/red]" if stats['errors'] > 0 else "0")
+
+    console.print()
+    console.print(Panel(table, expand=False, border_style="blue"))
 
     if stats["errors"] > 0:
         sys.exit(1)

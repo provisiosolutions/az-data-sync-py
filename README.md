@@ -1,6 +1,18 @@
 # Azure Blob Sync
 
-One-way sync tool that pulls files from an Azure Blob Storage container to your local machine. Only downloads new or changed files — safe to run repeatedly.
+A highly efficient **one-way sync tool** that securely pulls files from an Azure Blob Storage container to your local machine.
+
+## What is "One-Way Sync"?
+
+This tool strictly downloads data **from Azure to your local machine**. It will **never** upload local changes back to Azure, and it will **never** delete files from your Azure container. It only downloads new or changed files based on an ETag/Last-Modified manifest, making it safe to run repeatedly.
+
+## Common Use Cases
+
+- **Scheduled Backups**: Run via a cron job to keep a localized, up-to-date replica of a cloud container.
+- **Large Dataset Retrieval**: Sync machine learning training sets or large media libraries before processing them locally.
+- **Offline Content Delivery**: Pull down localized media and configuration files for edge devices, kiosks, or disconnected laptops.
+- **Cloud Migration**: Use this as the "download" step before uploading the retrieved files to another cloud provider (e.g., AWS S3).
+- **CI/CD Artifact Fetching**: Retrieve build artifacts or release binaries from a storage container onto a deployment server.
 
 ## Prerequisites
 
