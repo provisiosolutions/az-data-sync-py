@@ -1,0 +1,14 @@
+# Synced files output
+synced-files/
+
+# Config with secrets
+config.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sync manifest
+.sync_manifest.json

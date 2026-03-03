@@ -1,0 +1,7 @@
+{
+    "connection_string": "DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT;AccountKey=YOUR_KEY;EndpointSuffix=core.windows.net",
+    "container_name": "my-container",
+    "local_dir": "./synced-files",
+    "prefix": "",
+    "delete_orphaned": false
+}
