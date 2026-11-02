@@ -82,8 +82,12 @@
     class AudioPlayer extends HTMLElement {
       connectedCallback() {
         const src = this.getAttribute('src') || '';
-        this.innerHTML = `<audio src="$${src}" preload="none" controls></audio>`;
-        this._audio = this.querySelector('audio');
+        const audio = document.createElement('audio');
+        audio.src = src;
+        audio.preload = 'none';
+        audio.controls = true;
+        this.replaceChildren(audio);
+        this._audio = audio;
 
         // Pause every other player when this one starts
         this._audio.addEventListener('play', () => {

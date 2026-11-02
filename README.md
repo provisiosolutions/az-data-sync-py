@@ -114,7 +114,42 @@ python sync.py -c config.json --local-dir /data/backup
 | `--local-dir` | | `./synced-files` | Local directory to sync into |
 | `--prefix` | | `""` | Only sync blobs matching this prefix |
 | `--delete-orphaned` | | `false` | Remove local files deleted from Azure |
+| `--verify-local` | | `false` | Re-download blobs missing on disk even if manifest ETag matches |
+| `--push` | | `false` | Push local files to Azure Blob Storage instead of pulling |
+| `--classifier-root` | | — | Path to `audio-classifier-hear-me` root to push/pull dataset (106 MB), profile heads, and model weights |
+| `--skip-exports` | | `false` | Skip heavy Core ML / ONNX export bundles when syncing `--classifier-root` |
+| `--dry-run` | | `false` | Preview files to upload without transferring data |
 | `--verbose` | `-v` | `false` | Enable debug-level logging |
+
+## Backing Up & Restoring HearMe Classifier Audio & Weights
+
+Push or restore the `audio-classifier-hear-me` dataset (`dataset/train` 990 WAVs, `manifest.jsonl`, `splits/`), speaker profile heads (`profiles/kirk/head.pt`), and model weights (`results/best_model`, Core ML `.mlpackage`, ONNX) under the `classifier/` prefix in Azure Blob Storage:
+
+```bash
+# Dry-run preview of classifier files to upload
+python sync.py -c config.json --push --classifier-root ../audio-classifier-hear-me --dry-run
+
+# Push dataset, profile heads, and best_model + exports to Azure Blob Storage
+python sync.py -c config.json --push --classifier-root ../audio-classifier-hear-me
+
+# Restore dataset, profile heads, and model weights from Azure Blob Storage onto a new machine
+python sync.py -c config.json --classifier-root ../audio-classifier-hear-me
+```
+
+## Reviewing & Exporting Sessions (`review_sessions.py`)
+
+Generate a self-contained `synced-files/review.html` page (supporting legacy GUID folders, standalone `{friendlyName}/` folders, and nested `{sessionCode}/{friendlyName}/` folders) or export recordings into canonical HearMe classifier folders:
+
+```bash
+# Generate synced-files/review.html and open in browser
+python review_sessions.py
+
+# Generate review.html without opening browser
+python review_sessions.py --no-open
+
+# Export valid recordings into HearMe canonical phrase folders + export_manifest.jsonl
+python review_sessions.py --no-open --export-classifier ./classifier-export
+```
 
 ## How It Works
 

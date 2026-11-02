@@ -16,11 +16,14 @@ so the output remains a single portable HTML file.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import shutil
+import unicodedata
 import webbrowser
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
 from string import Template
@@ -32,6 +35,26 @@ SYNCED_DIR = _ROOT / "synced-files"
 MANIFEST_PATH = SYNCED_DIR / ".sync_manifest.json"
 OUTPUT_PATH = SYNCED_DIR / "review.html"
 TEMPLATE_DIR = _ROOT / "templates"
+
+_PHRASE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_APOSTROPHES = str.maketrans("", "", "'’")
+_UNSAFE_RUN = re.compile(r"[^a-z0-9_-]+")
+_SEPARATOR_RUN = re.compile(r"[_-]{2,}")
+
+
+def canonicalize_phrase_id(display_text: str) -> str:
+    """Convert phrase display text into a deterministic HearMe canonical phrase ID."""
+    cleaned = (display_text or "").strip()
+    if not cleaned:
+        return "unknown_phrase"
+    if _PHRASE_ID_PATTERN.fullmatch(cleaned):
+        return cleaned[:128]
+    normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.lower().translate(_APOSTROPHES)
+    phrase_id = _UNSAFE_RUN.sub("_", normalized)
+    phrase_id = _SEPARATOR_RUN.sub("_", phrase_id).strip("_-")
+    return (phrase_id or "unknown_phrase")[:128]
+
 
 # ── Data Models ───────────────────────────────────────────────────────────────
 
@@ -59,6 +82,7 @@ class Session:
     folder: str
     start_time: str = ""
     end_time: str = ""
+    session_code: str = ""
     recordings: list[Recording] = field(default_factory=list)
     wav_files: list[WavFile] = field(default_factory=list)
 
@@ -122,58 +146,91 @@ def format_timestamp(iso_str: str) -> str:
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 
-def load_manifest() -> dict:
+def load_manifest(manifest_path: Path | None = None) -> dict:
     """Load the sync manifest, returning an empty dict if missing."""
-    if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    path = manifest_path or MANIFEST_PATH
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
     return {}
 
 
-def discover_sessions() -> list[Session]:
-    """Walk every session folder, load metadata, and enrich with manifest."""
-    manifest = load_manifest()
+def discover_sessions(
+    synced_dir: Path | None = None,
+    manifest_path: Path | None = None,
+) -> list[Session]:
+    """Recursively walk every session folder, load metadata, and enrich with manifest or disk WAVs."""
+    root_dir = synced_dir or SYNCED_DIR
+    if not root_dir.exists():
+        return []
+
+    effective_manifest_path = manifest_path or (
+        root_dir / ".sync_manifest.json" if synced_dir is not None else MANIFEST_PATH
+    )
+    manifest = load_manifest(effective_manifest_path)
     sessions: list[Session] = []
 
-    for entry in sorted(SYNCED_DIR.iterdir()):
-        if not entry.is_dir():
-            continue
-        meta_path = entry / "metadata.json"
-        if not meta_path.exists():
+    for meta_path in sorted(root_dir.rglob("metadata.json")):
+        session_dir = meta_path.parent
+        rel_parts = session_dir.relative_to(root_dir).parts
+        rel_folder = "/".join(rel_parts)
+
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
             continue
 
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        session_code = str(meta.get("sessionCode", "") or "")
+        if not session_code and len(rel_parts) >= 2:
+            session_code = rel_parts[0]
 
         recordings = [
             Recording(
-                phrase_id=r.get("phraseId", "?"),
-                phrase=r.get("phrase", ""),
-                transcription=r.get("transcription", ""),
-                feedback=r.get("transcriptionFeedback", ""),
-                timestamp=r.get("timestamp", ""),
+                phrase_id=str(r.get("phraseId", "?")),
+                phrase=str(r.get("phrase", "")),
+                transcription=str(r.get("transcription", "")),
+                feedback=str(r.get("transcriptionFeedback", "")),
+                timestamp=str(r.get("timestamp", "")),
             )
             for r in meta.get("recordings", [])
         ]
 
-        wav_files = sorted(
-            [
-                WavFile(
-                    filename=key.split("/", 1)[1],
-                    size=info.get("size", 0),
-                    synced_at=info.get("synced_at", ""),
-                    last_modified=info.get("last_modified", ""),
+        prefix = f"{rel_folder}/"
+        wav_by_name: dict[str, WavFile] = {}
+        for key, info in manifest.items():
+            if key.startswith(prefix) and key.endswith(".wav"):
+                rel_wav = key[len(prefix) :]
+                if "/" not in rel_wav:
+                    wav_by_name[rel_wav] = WavFile(
+                        filename=rel_wav,
+                        size=int(info.get("size", 0) or 0),
+                        synced_at=str(info.get("synced_at", "") or ""),
+                        last_modified=str(info.get("last_modified", "") or ""),
+                    )
+
+        # Supplement with on-disk .wav files when manifest is missing or partial
+        for wav_path in session_dir.glob("*.wav"):
+            if wav_path.name not in wav_by_name:
+                stat = wav_path.stat()
+                wav_by_name[wav_path.name] = WavFile(
+                    filename=wav_path.name,
+                    size=stat.st_size,
+                    last_modified=datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
                 )
-                for key, info in manifest.items()
-                if key.startswith(f"{entry.name}/") and key.endswith(".wav")
-            ],
+
+        wav_files = sorted(
+            wav_by_name.values(),
             key=lambda w: _natural_sort_key(w.filename),
         )
 
         sessions.append(
             Session(
-                session_id=meta.get("sessionId", entry.name),
-                folder=entry.name,
-                start_time=meta.get("startTime", ""),
-                end_time=meta.get("endTime", ""),
+                session_id=str(meta.get("sessionId", session_dir.name)),
+                folder=rel_folder,
+                start_time=str(meta.get("startTime", "")),
+                end_time=str(meta.get("endTime", "")),
+                session_code=session_code,
                 recordings=recordings,
                 wav_files=wav_files,
             )
@@ -181,6 +238,74 @@ def discover_sessions() -> list[Session]:
 
     sessions.sort(key=lambda s: s.start_time, reverse=True)
     return sessions
+
+
+def export_sessions_for_classifier(
+    sessions: list[Session],
+    synced_dir: Path | None = None,
+    output_dir: Path | None = None,
+    include_bad_feedback: bool = False,
+) -> dict:
+    """Export synced session WAVs into HearMe canonical phrase folders and manifest.jsonl."""
+    root_dir = synced_dir or SYNCED_DIR
+    dest_dir = output_dir or (_ROOT / "classifier-export")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    exported_files = 0
+    skipped_bad = 0
+    missing_wav = 0
+    manifest_rows: list[dict] = []
+
+    for session in sessions:
+        session_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.folder).strip("_") or session.short_id
+        for rec in session.recordings:
+            if not include_bad_feedback and rec.feedback.lower() == "bad":
+                skipped_bad += 1
+                continue
+
+            src_wav = root_dir / session.folder / f"{rec.phrase_id}.wav"
+            if not src_wav.exists():
+                missing_wav += 1
+                continue
+
+            label = canonicalize_phrase_id(rec.phrase or rec.phrase_id)
+            label_dir = dest_dir / label
+            label_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_phrase_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(rec.phrase_id)).strip("_") or "take"
+            dest_filename = f"{session_slug}_{safe_phrase_id}.wav"
+            dest_wav = label_dir / dest_filename
+            shutil.copy2(src_wav, dest_wav)
+            exported_files += 1
+
+            manifest_rows.append(
+                {
+                    "session_id": session.session_id,
+                    "session_code": session.session_code,
+                    "folder": session.folder,
+                    "phrase_id": rec.phrase_id,
+                    "canonical_label": label,
+                    "display_text": rec.phrase,
+                    "transcription": rec.transcription,
+                    "feedback": rec.feedback,
+                    "timestamp": rec.timestamp or session.start_time,
+                    "audio_path": f"{label}/{dest_filename}",
+                }
+            )
+
+    manifest_out = dest_dir / "export_manifest.jsonl"
+    manifest_out.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in manifest_rows)
+        + ("\n" if manifest_rows else ""),
+        encoding="utf-8",
+    )
+
+    return {
+        "exported_files": exported_files,
+        "skipped_bad": skipped_bad,
+        "missing_wav": missing_wav,
+        "manifest_path": str(manifest_out),
+    }
 
 
 # ── HTML Rendering ────────────────────────────────────────────────────────────
@@ -236,6 +361,11 @@ def _render_session_card(session: Session, idx: int, total: int) -> str:
         if session.phrase_preview
         else "<em>No phrases</em>"
     )
+    code_badge = (
+        f'<span class="session-id-badge" title="Session Code">{html_escape(session.session_code)}</span>'
+        if session.session_code
+        else ""
+    )
 
     phrase_rows = "\n".join(
         _render_phrase_row(r, session) for r in session.recordings
@@ -249,6 +379,7 @@ def _render_session_card(session: Session, idx: int, total: int) -> str:
     <div class="header-left">
       <span class="session-number">Session {total - idx}</span>
       <span class="session-date">{label_date}</span>
+      {code_badge}
       <span class="session-id-badge" title="{html_escape(session.session_id)}">{html_escape(session.short_id)}</span>
     </div>
     <div class="header-right">
@@ -275,6 +406,7 @@ def _render_session_card(session: Session, idx: int, total: int) -> str:
     <div class="file-grid">{file_chips}</div>
 
     <div class="meta-footer">
+      <span>Folder: <code>{html_escape(session.folder)}</code></span>
       <span>Session ID: <code>{html_escape(session.session_id)}</code></span>
       <span>Start: {format_timestamp(session.start_time)}</span>
       <span>End: {format_timestamp(session.end_time)}</span>
@@ -307,19 +439,74 @@ def generate_html(sessions: list[Session]) -> str:
 # ── CLI Entry Point ──────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    import sys
+def build_review_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Generate review.html for synced recording sessions and optionally export for HearMe classifier."
+    )
+    p.add_argument(
+        "--synced-dir",
+        type=Path,
+        default=None,
+        help="Path to synced-files directory (defaults to ./synced-files).",
+    )
+    p.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output path for review.html (defaults to <synced-dir>/review.html).",
+    )
+    p.add_argument(
+        "--export-classifier",
+        type=Path,
+        default=None,
+        help="Export valid session WAVs into HearMe canonical phrase folders at this directory.",
+    )
+    p.add_argument(
+        "--include-bad",
+        action="store_true",
+        help="Include recordings marked with 'bad' feedback when exporting for the classifier.",
+    )
+    p.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not automatically open review.html in the default browser.",
+    )
+    return p
 
-    print("📂 Scanning synced-files directory…")
-    sessions = discover_sessions()
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_review_parser()
+    args = parser.parse_args(argv)
+
+    synced_dir = args.synced_dir or SYNCED_DIR
+    output_path = args.output or (
+        synced_dir / "review.html" if args.synced_dir is not None else OUTPUT_PATH
+    )
+
+    print(f"📂 Scanning {synced_dir} directory…")
+    sessions = discover_sessions(synced_dir=synced_dir)
     print(f"   Found {len(sessions)} sessions")
 
     html = generate_html(sessions)
-    OUTPUT_PATH.write_text(html, encoding="utf-8")
-    print(f"✅ Review page written to: {OUTPUT_PATH}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+    print(f"✅ Review page written to: {output_path}")
 
-    if "--no-open" not in sys.argv:
-        webbrowser.open(OUTPUT_PATH.as_uri())
+    if args.export_classifier is not None:
+        export_stats = export_sessions_for_classifier(
+            sessions=sessions,
+            synced_dir=synced_dir,
+            output_dir=args.export_classifier,
+            include_bad_feedback=args.include_bad,
+        )
+        print(
+            f"📦 Exported {export_stats['exported_files']} WAVs for classifier "
+            f"(skipped_bad={export_stats['skipped_bad']}, missing_wav={export_stats['missing_wav']}) "
+            f"→ {export_stats['manifest_path']}"
+        )
+
+    if not args.no_open:
+        webbrowser.open(output_path.resolve().as_uri())
 
 
 if __name__ == "__main__":

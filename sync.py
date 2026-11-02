@@ -54,23 +54,26 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 console = Console()
 
 # ---------------------------------------------------------------------------
-# Manifest helpers (tracks what we already have locally)
+# Manifest helpers (tracks what we already have locally / pushed remotely)
 # ---------------------------------------------------------------------------
 MANIFEST_FILE = ".sync_manifest.json"
+PUSH_MANIFEST_FILE = ".push_manifest.json"
+_IGNORED_FILENAMES = {MANIFEST_FILE, PUSH_MANIFEST_FILE, ".DS_Store", "Thumbs.db"}
 
 
-def load_manifest(local_dir: Path) -> dict:
+def load_manifest(local_dir: Path, filename: str = MANIFEST_FILE) -> dict:
     """Load the sync manifest that tracks etag/md5 of previously synced blobs."""
-    manifest_path = local_dir / MANIFEST_FILE
+    manifest_path = local_dir / filename
     if manifest_path.exists():
         with open(manifest_path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_manifest(local_dir: Path, manifest: dict) -> None:
+def save_manifest(local_dir: Path, manifest: dict, filename: str = MANIFEST_FILE) -> None:
     """Persist the sync manifest."""
-    manifest_path = local_dir / MANIFEST_FILE
+    local_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = local_dir / filename
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
 
@@ -118,6 +121,8 @@ def sync_container(
     delete_orphaned: bool = False,
     max_workers: int = 8,
     max_size_bytes: int = 50 * 1024**3,
+    verify_local_files: bool = False,
+    strip_prefix: str = "",
 ) -> dict:
     """
     One-way sync: Azure Blob → local filesystem using concurrent workers.
@@ -127,6 +132,13 @@ def sync_container(
     local_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(local_dir)
     new_manifest: dict = {}
+
+    # Preserve manifest entries outside the active prefix so partial syncs
+    # neither wipe unrelated manifest records nor delete unrelated local files.
+    if prefix:
+        for key, val in manifest.items():
+            if not key.startswith(prefix):
+                new_manifest[key] = val
 
     stats = {"downloaded": 0, "skipped": 0, "deleted": 0, "errors": 0}
 
@@ -147,8 +159,16 @@ def sync_container(
         if blob_name.endswith("/"):
             continue
 
+        rel_name = (
+            blob_name[len(strip_prefix) :]
+            if strip_prefix and blob_name.startswith(strip_prefix)
+            else blob_name
+        )
+        if not rel_name:
+            continue
+
         # SECURITY: Check for directory traversal / escape attacks
-        dest_path = (local_dir / blob_name).resolve()
+        dest_path = (local_dir / rel_name).resolve()
         if not dest_path.is_relative_to(resolved_local_dir):
             log.warning("SKIP  %s  (SECURITY: Path escapes local directory)", blob_name)
             stats["skipped"] += 1
@@ -161,13 +181,14 @@ def sync_container(
             continue
 
         entry = manifest.get(blob_name)
+        local_missing = verify_local_files and not dest_path.exists()
 
-        if not should_download(blob, entry):
+        if not local_missing and not should_download(blob, entry):
             log.debug("SKIP  %s  (unchanged)", blob_name)
             new_manifest[blob_name] = entry  # carry forward
             stats["skipped"] += 1
         else:
-            to_download.append((blob, entry))
+            to_download.append((blob, entry, dest_path))
 
     if to_download:
         with Progress(
@@ -184,9 +205,9 @@ def sync_container(
                 # Submit all download tasks
                 future_to_blob = {
                     executor.submit(
-                        _download_blob, container_client, blob.name, local_dir / blob.name
+                        _download_blob, container_client, blob.name, dest_path
                     ): (blob, entry)
-                    for blob, entry in to_download
+                    for blob, entry, dest_path in to_download
                 }
 
                 # Handle results as they complete
@@ -226,6 +247,247 @@ def sync_container(
     save_manifest(local_dir, new_manifest)
     
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Upload / Push & HearMe Classifier Artifact Backup
+# ---------------------------------------------------------------------------
+
+def should_upload(local_path: Path, push_entry: dict | None, remote_blob=None) -> bool:
+    """Decide whether a local file needs to be uploaded to Azure Blob Storage."""
+    stat = local_path.stat()
+    if push_entry is not None:
+        if (
+            push_entry.get("size") == stat.st_size
+            and push_entry.get("mtime_ns") == stat.st_mtime_ns
+        ):
+            if remote_blob is None or (
+                not push_entry.get("etag") or remote_blob.etag == push_entry.get("etag")
+            ):
+                return False
+
+    if remote_blob is not None and push_entry is None:
+        remote_mtime = getattr(remote_blob, "last_modified", None)
+        local_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if getattr(remote_blob, "size", None) == stat.st_size and remote_mtime and remote_mtime >= local_mtime:
+            return False
+
+    return True
+
+
+def _upload_blob(container_client: ContainerClient, blob_name: str, local_path: Path) -> str | None:
+    """Worker function to upload a single local file to Azure Blob Storage."""
+    blob_client = container_client.get_blob_client(blob_name)
+    log.debug("UP    %s", blob_name)
+    with open(local_path, "rb") as f:
+        result = blob_client.upload_blob(f, overwrite=True)
+    if isinstance(result, dict):
+        return result.get("etag")
+    return getattr(result, "etag", None)
+
+
+def push_directory(
+    container_client: ContainerClient,
+    local_dir: Path,
+    remote_prefix: str = "",
+    max_workers: int = 8,
+    max_size_bytes: int = 50 * 1024**3,
+    dry_run: bool = False,
+) -> dict:
+    """
+    One-way push: local directory → Azure Blob Storage using concurrent workers.
+    Skips symbolic links so deduplicated audio directories are not uploaded twice.
+    """
+    stats = {"uploaded": 0, "skipped": 0, "deleted": 0, "errors": 0}
+    if not local_dir.exists():
+        log.warning("Local directory %s does not exist; nothing to push.", local_dir)
+        return stats
+
+    norm_prefix = remote_prefix.strip("/")
+    if norm_prefix:
+        norm_prefix += "/"
+
+    manifest = load_manifest(local_dir, PUSH_MANIFEST_FILE)
+    new_manifest = dict(manifest)
+
+    remote_blobs: dict[str, object] = {}
+    try:
+        for b in container_client.list_blobs(name_starts_with=norm_prefix or None):
+            remote_blobs[b.name] = b
+    except Exception as exc:
+        log.debug("Could not pre-list remote blobs (%s); relying on local push manifest.", exc)
+
+    to_upload: list[tuple[Path, str, os.stat_result, dict | None]] = []
+
+    for root, dirs, files in os.walk(local_dir, followlinks=False):
+        root_path = Path(root)
+        # Filter out symlinked directories and cache folders
+        dirs[:] = [
+            d for d in sorted(dirs)
+            if d != "__pycache__" and not (root_path / d).is_symlink()
+        ]
+        for fname in sorted(files):
+            if fname in _IGNORED_FILENAMES or fname.endswith(".tmp"):
+                continue
+            fpath = root_path / fname
+            if fpath.is_symlink():
+                continue
+            fstat = fpath.stat()
+            if fstat.st_size > max_size_bytes:
+                log.warning("SKIP  %s  (Exceeds max size limit of %d bytes)", fpath, max_size_bytes)
+                stats["skipped"] += 1
+                continue
+
+            rel_posix = fpath.relative_to(local_dir).as_posix()
+            blob_name = f"{norm_prefix}{rel_posix}"
+            entry = manifest.get(blob_name)
+            remote_blob = remote_blobs.get(blob_name)
+
+            if not should_upload(fpath, entry, remote_blob=remote_blob):
+                if entry is None and remote_blob is not None:
+                    new_manifest[blob_name] = {
+                        "size": fstat.st_size,
+                        "mtime_ns": fstat.st_mtime_ns,
+                        "etag": getattr(remote_blob, "etag", None),
+                        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                stats["skipped"] += 1
+            else:
+                to_upload.append((fpath, blob_name, fstat, entry))
+
+    if dry_run:
+        stats["uploaded"] = len(to_upload)
+        return stats
+
+    if to_upload:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("[cyan]Uploading files...", total=len(to_upload))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {
+                    executor.submit(_upload_blob, container_client, blob_name, fpath): (
+                        fpath,
+                        blob_name,
+                        fstat,
+                        entry,
+                    )
+                    for fpath, blob_name, fstat, entry in to_upload
+                }
+                for future in concurrent.futures.as_completed(future_to_item):
+                    fpath, blob_name, fstat, entry = future_to_item[future]
+                    try:
+                        etag = future.result()
+                        new_manifest[blob_name] = {
+                            "size": fstat.st_size,
+                            "mtime_ns": fstat.st_mtime_ns,
+                            "etag": etag,
+                            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        stats["uploaded"] += 1
+                    except Exception as exc:
+                        log.error("FAIL  %s  → %s", blob_name, exc)
+                        if entry:
+                            new_manifest[blob_name] = entry
+                        stats["errors"] += 1
+                    progress.advance(task_id)
+
+    save_manifest(local_dir, new_manifest, PUSH_MANIFEST_FILE)
+    return stats
+
+
+def sync_classifier_artifacts(
+    container_client: ContainerClient,
+    classifier_root: Path,
+    direction: str = "push",
+    remote_base_prefix: str = "classifier",
+    include_exports: bool = True,
+    max_workers: int = 8,
+    max_size_bytes: int = 50 * 1024**3,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Push or pull HearMe audio-classifier dataset (106 MB), profile heads,
+    and model checkpoints/exports (best_model, Core ML, ONNX) to/from Azure Blob Storage.
+    """
+    base_prefix = remote_base_prefix.strip("/")
+    targets: list[tuple[Path, str]] = [
+        (classifier_root / "dataset", f"{base_prefix}/dataset"),
+        (classifier_root / "profiles", f"{base_prefix}/profiles"),
+        (classifier_root / "results" / "best_model", f"{base_prefix}/results/best_model"),
+    ]
+    if include_exports:
+        targets.append(
+            (
+                classifier_root / "results" / "HearMeClassifier_flexible.mlpackage",
+                f"{base_prefix}/results/HearMeClassifier_flexible.mlpackage",
+            )
+        )
+
+    totals = {"uploaded": 0, "downloaded": 0, "skipped": 0, "deleted": 0, "errors": 0}
+
+    if direction == "push":
+        for local_target, remote_pref in targets:
+            if local_target.is_dir():
+                sub = push_directory(
+                    container_client,
+                    local_target,
+                    remote_prefix=remote_pref,
+                    max_workers=max_workers,
+                    max_size_bytes=max_size_bytes,
+                    dry_run=dry_run,
+                )
+                for k in ("uploaded", "skipped", "errors"):
+                    totals[k] += sub.get(k, 0)
+
+        # Also push single-file exports (HearMeClassifier.onnx, metadata, parity_baseline)
+        if include_exports:
+            results_dir = classifier_root / "results"
+            for single_name in (
+                "HearMeClassifier.onnx",
+                "HearMeClassifier_metadata.json",
+                "parity_baseline.json",
+            ):
+                fpath = results_dir / single_name
+                if fpath.is_file():
+                    blob_name = f"{base_prefix}/results/{single_name}"
+                    if dry_run:
+                        totals["uploaded"] += 1
+                    else:
+                        try:
+                            _upload_blob(container_client, blob_name, fpath)
+                            totals["uploaded"] += 1
+                        except Exception as exc:
+                            log.error("FAIL  %s  → %s", blob_name, exc)
+                            totals["errors"] += 1
+    else:
+        # Pull classifier prefix into classifier_root, stripping the remote base_prefix
+        sub = sync_container(
+            container_client,
+            classifier_root,
+            prefix=f"{base_prefix}/",
+            strip_prefix=f"{base_prefix}/",
+            delete_orphaned=False,
+            max_workers=max_workers,
+            max_size_bytes=max_size_bytes,
+            verify_local_files=True,
+        )
+        for k in ("downloaded", "skipped", "deleted", "errors"):
+            totals[k] += sub.get(k, 0)
+
+        # Ensure deduplicated symlink profiles/kirk/audio_data -> ../../dataset/train exists
+        kirk_dir = classifier_root / "profiles" / "kirk"
+        kirk_audio = kirk_dir / "audio_data"
+        train_dir = classifier_root / "dataset" / "train"
+        if kirk_dir.is_dir() and train_dir.is_dir() and not kirk_audio.exists() and not kirk_audio.is_symlink():
+            kirk_audio.symlink_to(Path("../../dataset/train"))
+
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +543,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clean up: delete local files that no longer exist in the remote container.",
     )
     p.add_argument(
+        "--verify-local",
+        action="store_true",
+        help="Re-download blobs if the local file is missing on disk even when manifest ETag matches.",
+    )
+    p.add_argument(
+        "--push",
+        action="store_true",
+        help="Push local files to Azure Blob Storage instead of pulling.",
+    )
+    p.add_argument(
+        "--classifier-root",
+        type=Path,
+        default=None,
+        help="Path to audio-classifier-hear-me root to push/pull dataset (106 MB), profile heads, and model weights.",
+    )
+    p.add_argument(
+        "--skip-exports",
+        action="store_true",
+        help="When syncing --classifier-root, skip heavy Core ML / ONNX export bundles.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview files to upload without transferring data.",
+    )
+    p.add_argument(
         "--workers",
         type=int,
         default=8,
-        help="Number of concurrent download threads to use. Default is 8.",
+        help="Number of concurrent download/upload threads to use. Default is 8.",
     )
     p.add_argument(
         "--max-size-gb",
@@ -328,6 +616,7 @@ def main() -> None:
     
     prefix = args.prefix or cfg.get("prefix", "")
     delete_orphaned = args.delete_orphaned or cfg.get("delete_orphaned", False)
+    verify_local = getattr(args, "verify_local", False) or cfg.get("verify_local", False)
     workers = getattr(args, "workers", cfg.get("workers", 8))
     max_size_gb = getattr(args, "max_size_gb", cfg.get("max_size_gb", 50.0))
 
@@ -355,25 +644,52 @@ def main() -> None:
         sys.exit(1)
         
     container_client = blob_service.get_container_client(container_name)
+    max_size_bytes = int(max_size_gb * 1024**3)
 
-    stats = sync_container(
-        container_client,
-        local_dir,
-        prefix=prefix,
-        delete_orphaned=delete_orphaned,
-        max_workers=workers,
-        max_size_bytes=int(max_size_gb * 1024**3),
-    )
+    if args.classifier_root is not None:
+        direction = "push" if args.push else "pull"
+        stats = sync_classifier_artifacts(
+            container_client,
+            args.classifier_root,
+            direction=direction,
+            remote_base_prefix=prefix or "classifier",
+            include_exports=not args.skip_exports,
+            max_workers=workers,
+            max_size_bytes=max_size_bytes,
+            dry_run=args.dry_run,
+        )
+    elif args.push:
+        stats = push_directory(
+            container_client,
+            local_dir,
+            remote_prefix=prefix,
+            max_workers=workers,
+            max_size_bytes=max_size_bytes,
+            dry_run=args.dry_run,
+        )
+    else:
+        stats = sync_container(
+            container_client,
+            local_dir,
+            prefix=prefix,
+            delete_orphaned=delete_orphaned,
+            max_workers=workers,
+            max_size_bytes=max_size_bytes,
+            verify_local_files=verify_local,
+        )
 
     # ── Summary ─────────────────────────────────────────────────
     table = Table(title="Sync Complete")
     table.add_column("Action", style="cyan")
     table.add_column("Count", justify="right", style="green")
 
-    table.add_row("Downloaded", str(stats["downloaded"]))
-    table.add_row("Skipped", str(stats["skipped"]))
-    table.add_row("Deleted", str(stats["deleted"]))
-    table.add_row("Errors", f"[red]{stats['errors']}[/red]" if stats['errors'] > 0 else "0")
+    if "uploaded" in stats and (args.push or stats.get("uploaded", 0) > 0):
+        table.add_row("Uploaded", str(stats.get("uploaded", 0)))
+    if "downloaded" in stats and (not args.push or stats.get("downloaded", 0) > 0):
+        table.add_row("Downloaded", str(stats.get("downloaded", 0)))
+    table.add_row("Skipped", str(stats.get("skipped", 0)))
+    table.add_row("Deleted", str(stats.get("deleted", 0)))
+    table.add_row("Errors", f"[red]{stats['errors']}[/red]" if stats.get("errors", 0) > 0 else "0")
 
     console.print()
     console.print(Panel(table, expand=False, border_style="blue"))
