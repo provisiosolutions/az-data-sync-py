@@ -1,5 +1,7 @@
 # Synced files output
 synced-files/
+raw-sessions/
+trained-heads/
 
 # Config with secrets
 config.json
@@ -10,5 +12,7 @@ __pycache__/
 .venv/
 venv/
 
-# Sync manifest
+# Sync manifests
 .sync_manifest.json
+.push_manifest.json
+

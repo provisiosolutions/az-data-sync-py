@@ -7,24 +7,32 @@ Run:  py -3 -m pytest test_sync.py -v
 
 import json
 import logging
+import re
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from azure.core.exceptions import ResourceExistsError
 import pytest
 
 from sync import (
     MANIFEST_FILE,
     PUSH_MANIFEST_FILE,
+    build_swa_phrase_seeds,
     load_config,
     load_manifest,
+    parse_raw_clip_stem,
     push_directory,
     save_manifest,
     should_download,
     should_upload,
+    stage_classifier_raw_sessions,
+    stage_trained_heads,
     sync_classifier_artifacts,
     sync_container,
+    to_snake_case,
 )
 from review_sessions import (
     canonicalize_phrase_id,
@@ -585,5 +593,380 @@ class TestPushAndClassifierSync:
         assert (tmp_path / "results" / "best_model" / "model.safetensors").read_bytes() == b"payload"
         assert (tmp_path / "profiles" / "kirk" / "audio_data").is_symlink()
         assert (tmp_path / "profiles" / "kirk" / "audio_data" / "water" / "water_01.wav").exists()
+
+
+# ===========================================================================
+# stage_classifier_raw_sessions(), stage_trained_heads(), and dual-head sync
+# ===========================================================================
+
+class TestStageRawSessionsAndHeads:
+    def _build_classifier_fixture(self, root: Path) -> Path:
+        cls_root = root / "classifier"
+        (cls_root / "dataset" / "train" / "all").mkdir(parents=True)
+        (cls_root / "dataset" / "train" / "ache").mkdir(parents=True)
+        (cls_root / "dataset" / "train" / "bless_you").mkdir(parents=True)
+
+        (cls_root / "dataset" / "train" / "all" / "all_01.wav").write_bytes(b"aug-wav")
+        (cls_root / "dataset" / "train" / "ache" / "ache_01.wav").write_bytes(b"sep-wav")
+        (cls_root / "dataset" / "train" / "bless_you" / "bless_you_01.wav").write_bytes(b"nov-resampled")
+
+        manifest_rows = [
+            {"label": "all", "path": "train/all/all_01.wav", "session_id": "session_2026-08-25"},
+            {"label": "ache", "path": "train/ache/ache_01.wav", "session_id": "session_2026-09-25"},
+            {"label": "bless_you", "path": "train/bless_you/bless_you_01.wav", "session_id": "session_2026-11-18"},
+        ]
+        (cls_root / "dataset" / "manifest.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in manifest_rows) + "\n",
+            encoding="utf-8",
+        )
+
+        edited = cls_root / "Edited_Clips"
+        edited.mkdir()
+        (edited / "Bless you.wav").write_bytes(b"nov-raw-48k")
+        (edited / "Video.mp4").write_bytes(b"mp4-bytes")
+        return cls_root
+
+    def test_stage_classifier_raw_sessions_separates_sessions_and_skips_mp4(self, tmp_path):
+        cls_root = self._build_classifier_fixture(tmp_path)
+        dest_dir = tmp_path / "raw-sessions"
+
+        stats = stage_classifier_raw_sessions(cls_root, dest_dir)
+        assert stats["copied"] == 3
+        assert stats["unchanged"] == 0
+        assert stats["skipped_mp4"] == 1
+        assert stats["removed_stale"] == 0
+        assert stats["sessions"] == {
+            "session_2026_08_25": 1,
+            "session_2026_09_25": 1,
+            "session_2026_11_18_edited_clips": 1,
+        }
+
+        assert (dest_dir / "session_2026_08_25" / "all" / "all_01.wav").read_bytes() == b"aug-wav"
+        assert (dest_dir / "session_2026_09_25" / "ache" / "ache_01.wav").read_bytes() == b"sep-wav"
+        assert (
+            dest_dir / "session_2026_11_18_edited_clips" / "bless_you" / "bless_you_01.wav"
+        ).read_bytes() == b"nov-raw-48k"
+        assert not (dest_dir / "session_2026_11_18").exists()
+        assert not (dest_dir / "session_2026-11-18").exists()
+        assert not (dest_dir / "session_2026_11_18_edited_clips" / "video" / "video_01.mp4").exists()
+
+        for sname in (
+            "session_2026_08_25",
+            "session_2026_09_25",
+            "session_2026_11_18_edited_clips",
+        ):
+            assert (dest_dir / sname / "session_manifest.jsonl").is_file()
+
+        assert (dest_dir / "manifest.jsonl").is_file()
+        assert (dest_dir / "lexicon.json").is_file()
+
+        # Re-running is idempotent
+        stats_again = stage_classifier_raw_sessions(cls_root, dest_dir)
+        assert stats_again["copied"] == 0
+        assert stats_again["unchanged"] == 3
+        assert stats_again["skipped_mp4"] == 1
+        assert stats_again["removed_stale"] == 0
+
+    def test_stage_classifier_raw_sessions_includes_mp4_when_requested(self, tmp_path):
+        cls_root = self._build_classifier_fixture(tmp_path)
+        dest_dir = tmp_path / "raw-sessions"
+
+        stats = stage_classifier_raw_sessions(cls_root, dest_dir, include_mp4=True)
+        assert stats["copied"] == 4
+        assert stats["skipped_mp4"] == 0
+        assert stats["sessions"]["session_2026_11_18_edited_clips"] == 2
+        assert (
+            dest_dir / "session_2026_11_18_edited_clips" / "video" / "video_01.mp4"
+        ).read_bytes() == b"mp4-bytes"
+
+    def test_stage_trained_heads_copies_profiles_and_skips_symlinks(self, tmp_path):
+        cls_root = self._build_classifier_fixture(tmp_path)
+        kirk_dir = cls_root / "profiles" / "kirk"
+        kirk_dir.mkdir(parents=True)
+        (kirk_dir / "head.pt").write_bytes(b"kirk-head")
+        (kirk_dir / "audio_data").symlink_to(Path("../../dataset/train"))
+
+        kirk_core_dir = cls_root / "profiles" / "kirk_core"
+        (kirk_core_dir / "checkpoints").mkdir(parents=True)
+        (kirk_core_dir / "head.pt").write_bytes(b"core-head")
+        (kirk_core_dir / "checkpoints" / "ckpt.pt").write_bytes(b"core-ckpt")
+        (kirk_core_dir / "audio_data").mkdir()
+        (kirk_core_dir / "audio_data" / "bless_you").symlink_to(Path("../../../dataset/train/bless_you"))
+
+        dest_dir = tmp_path / "trained-heads"
+        stats = stage_trained_heads(cls_root, dest_dir)
+
+        assert stats["copied"] == 3
+        assert stats["unchanged"] == 0
+        assert stats["profiles"] == {"kirk": 1, "kirk_core": 2}
+        assert (dest_dir / "kirk" / "head.pt").read_bytes() == b"kirk-head"
+        assert (dest_dir / "kirk_core" / "head.pt").read_bytes() == b"core-head"
+        assert (dest_dir / "kirk_core" / "checkpoints" / "ckpt.pt").read_bytes() == b"core-ckpt"
+        assert not (dest_dir / "kirk" / "audio_data").exists()
+        assert not (dest_dir / "kirk_core" / "audio_data").exists()
+
+    def test_push_directory_creates_container_only_when_not_dry_run(self, tmp_path):
+        (tmp_path / "sample.wav").write_bytes(b"wav")
+        client = make_container_client([])
+        client.get_blob_client.return_value.upload_blob.return_value = {"etag": '"e1"'}
+
+        dry_stats = push_directory(client, tmp_path, dry_run=True)
+        assert dry_stats["uploaded"] == 1
+        client.create_container.assert_not_called()
+
+        client.create_container.side_effect = ResourceExistsError("exists")
+        live_stats = push_directory(client, tmp_path, dry_run=False)
+        assert live_stats["uploaded"] == 1
+        client.create_container.assert_called_once()
+
+    def test_sync_classifier_artifacts_pull_restores_kirk_core_symlinks(self, tmp_path):
+        blobs = [
+            make_blob("classifier/dataset/train/water/water_01.wav", etag='"e1"'),
+            make_blob("classifier/profiles/kirk_core/labels.json", etag='"e2"'),
+        ]
+        client = make_container_client(blobs)
+
+        def get_blob_side_effect(blob_name: str):
+            bc = MagicMock()
+            stream = MagicMock()
+            payload = b'["water"]' if blob_name.endswith("labels.json") else b"wav-bytes"
+            stream.readinto = lambda f, p=payload: f.write(p)
+            bc.download_blob.return_value = stream
+            return bc
+
+        client.get_blob_client.side_effect = get_blob_side_effect
+
+        stats = sync_classifier_artifacts(
+            client,
+            classifier_root=tmp_path,
+            direction="pull",
+        )
+        assert stats["downloaded"] == 2
+        link = tmp_path / "profiles" / "kirk_core" / "audio_data" / "water"
+        assert link.is_symlink()
+        assert (link / "water_01.wav").read_bytes() == b"wav-bytes"
+
+    def test_should_upload_matches_quoted_manifest_etag_against_unquoted_remote_etag(self, tmp_path):
+        f = tmp_path / "head.pt"
+        f.write_bytes(b"head-weights")
+        stat = f.stat()
+        push_entry = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "etag": '"0x8DF45B039D26E8B"',
+        }
+        remote_blob = make_blob(
+            "kirk/head.pt",
+            etag="0x8DF45B039D26E8B",
+            size=stat.st_size,
+        )
+        assert should_upload(f, push_entry, remote_blob=remote_blob) is False
+
+        remote_blob.etag = "0xDIFFERENT"
+        assert should_upload(f, push_entry, remote_blob=remote_blob) is True
+
+    def test_stage_classifier_raw_sessions_enforces_snake_case_wav_metadata_and_prunes_stale(self, tmp_path):
+        cls_root = tmp_path / "classifier"
+        (cls_root / "dataset").mkdir(parents=True)
+        edited = cls_root / "Edited_Clips"
+        edited.mkdir()
+
+        wav_path = edited / "I'm not getting up today-2 (1).wav"
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(b"\x00" * (24000 * 2 * 2))
+
+        assert to_snake_case("I'm not getting up today") == "im_not_getting_up_today"
+        assert parse_raw_clip_stem("I'm not getting up today-2 (1)") == (
+            "im_not_getting_up_today",
+            "I'm not getting up today",
+        )
+
+        dest_dir = tmp_path / "raw-sessions"
+        stale_dir = dest_dir / "session_2026-11-18-edited-clips"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "Old File.wav").write_bytes(b"stale")
+
+        stats = stage_classifier_raw_sessions(cls_root, dest_dir)
+        assert stats["copied"] == 1
+        assert stats["removed_stale"] == 1
+        assert not stale_dir.exists()
+
+        snake_rel_re = re.compile(r"^[a-z0-9_]+(?:/[a-z0-9_]+)*\.[a-z0-9]+$")
+        for fpath in dest_dir.rglob("*"):
+            if fpath.is_file():
+                rel = fpath.relative_to(dest_dir).as_posix()
+                assert snake_rel_re.match(rel), f"Non-snake_case path found: {rel}"
+
+        manifest_rows = [
+            json.loads(line)
+            for line in (dest_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(manifest_rows) == 1
+        row = manifest_rows[0]
+        assert row["label"] == "im_not_getting_up_today"
+        assert row["display_text"] == "I'm not getting up today"
+        assert row["original_filename"] == "I'm not getting up today-2 (1).wav"
+        assert row["sample_rate"] == 48000
+        assert row["channels"] == 2
+        assert row["duration_s"] == 0.5
+        assert row["path"] == (
+            "session_2026_11_18_edited_clips/im_not_getting_up_today/im_not_getting_up_today_01.wav"
+        )
+
+        lexicon = json.loads((dest_dir / "lexicon.json").read_text(encoding="utf-8"))
+        assert lexicon["phrases"] == [
+            {"id": "im_not_getting_up_today", "display_text": "I'm not getting up today"}
+        ]
+
+    def test_push_directory_delete_orphaned_dry_run_and_live(self, tmp_path):
+        local_wav = tmp_path / "session_2026_08_25" / "all" / "all_01.wav"
+        local_wav.parent.mkdir(parents=True)
+        local_wav.write_bytes(b"wav-bytes")
+
+        client = make_container_client([make_blob("session_2026-08-25/old.wav")])
+        client.get_blob_client.return_value.upload_blob.return_value = {"etag": '"e1"'}
+
+        dry_stats = push_directory(client, tmp_path, delete_orphaned=True, dry_run=True)
+        assert dry_stats["uploaded"] == 1
+        assert dry_stats["deleted"] == 1
+        client.delete_blob.assert_not_called()
+
+        live_stats = push_directory(client, tmp_path, delete_orphaned=True, dry_run=False)
+        assert live_stats["uploaded"] == 1
+        assert live_stats["deleted"] == 1
+        client.delete_blob.assert_called_once_with("session_2026-08-25/old.wav")
+
+    def test_build_swa_phrase_seeds_excludes_silence_and_builds_deterministic_lists(self, tmp_path):
+        lexicon_path = tmp_path / "lexicon.json"
+        lexicon_path.write_text(
+            json.dumps(
+                {
+                    "phrases": [
+                        {"id": "bless_you", "display_text": "Bless you"},
+                        {"id": "eat_now", "display_text": "Eat now"},
+                        {"id": "silence", "display_text": "Silence"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        core_labels_path = tmp_path / "labels.json"
+        core_labels_path.write_text(json.dumps(["bless_you", "silence"]), encoding="utf-8")
+
+        first = build_swa_phrase_seeds(
+            lexicon_path,
+            core_labels_path=core_labels_path,
+            timestamp_iso="2026-11-18T16:00:00Z",
+        )
+        second = build_swa_phrase_seeds(
+            lexicon_path,
+            core_labels_path=core_labels_path,
+            timestamp_iso="2026-11-18T16:00:00Z",
+        )
+        assert first == second
+
+        assert len(first["phrase_lists"]) == 2
+        lists_by_slug = {v["slug"]: v for v in first["phrase_lists"].values()}
+        full_list = lists_by_slug["kirk-full-classifier-lexicon"]
+        core_list = lists_by_slug["kirk-core-session-phrases"]
+
+        assert full_list["isPublished"] is True
+        assert full_list["title"] == "Kirk - Full Classifier Lexicon (2)"
+        assert [p["text"] for p in full_list["phrases"]] == ["Bless you", "Eat now"]
+        assert [p["orderIndex"] for p in full_list["phrases"]] == [0, 1]
+
+        assert core_list["isPublished"] is True
+        assert core_list["title"] == "Kirk - Core Session Phrases (1)"
+        assert [p["text"] for p in core_list["phrases"]] == ["Bless you"]
+        assert [p["orderIndex"] for p in core_list["phrases"]] == [0]
+
+        assert first["phrase_sets"]["kirk-full-lexicon.json"]["phrases"] == ["Bless you", "Eat now"]
+        assert first["phrase_sets"]["kirk-full-lexicon.json"]["phrasesPerSession"] == 20
+        assert first["phrase_sets"]["kirk-core-phrases.json"]["phrases"] == ["Bless you"]
+        assert first["phrase_sets"]["kirk-core-phrases.json"]["phrasesPerSession"] == 1
+
+    def test_should_upload_skips_cleanly_pulled_file_via_sync_manifest(self, tmp_path):
+        f = tmp_path / "all_01.wav"
+        f.write_bytes(b"wav-data")
+        stat = f.stat()
+        sync_entry = {
+            "etag": "0xABCD",
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        stale_push_entry = {
+            "etag": '"0xOLD"',
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns - 1000,
+        }
+        remote_blob = make_blob("all_01.wav", etag="0xABCD", size=stat.st_size)
+
+        assert (
+            should_upload(f, stale_push_entry, remote_blob=remote_blob, sync_entry=sync_entry)
+            is False
+        )
+        remote_blob.etag = "0xCHANGED"
+        assert (
+            should_upload(f, stale_push_entry, remote_blob=remote_blob, sync_entry=sync_entry)
+            is True
+        )
+
+    def test_stage_trained_heads_prunes_stale_checkpoints_and_syncs_core_exports(self, tmp_path):
+        cls_root = self._build_classifier_fixture(tmp_path)
+        kirk_ckpts = cls_root / "profiles" / "kirk" / "checkpoints"
+        kirk_ckpts.mkdir(parents=True)
+        (cls_root / "profiles" / "kirk" / "head.pt").write_bytes(b"kirk-new-head")
+        (kirk_ckpts / "head_new.pt").write_bytes(b"new-ckpt")
+
+        dest_dir = tmp_path / "trained-heads"
+        stale_ckpt = dest_dir / "kirk" / "checkpoints" / "stale_old.pt"
+        stale_ckpt.parent.mkdir(parents=True)
+        stale_ckpt.write_bytes(b"stale-ckpt")
+        (dest_dir / ".push_manifest.json").write_text("{}", encoding="utf-8")
+
+        stats = stage_trained_heads(cls_root, dest_dir)
+        assert stats["copied"] == 2
+        assert stats["removed_stale"] == 1
+        assert not stale_ckpt.exists()
+        assert (dest_dir / ".push_manifest.json").is_file()
+        assert (dest_dir / "kirk" / "checkpoints" / "head_new.pt").is_file()
+
+        results_dir = cls_root / "results"
+        (results_dir / "best_model").mkdir(parents=True)
+        (results_dir / "best_model" / "config.json").write_text("{}", encoding="utf-8")
+        (results_dir / "best_model_core").mkdir(parents=True)
+        (results_dir / "best_model_core" / "config.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeClassifier_flexible.mlpackage").mkdir(parents=True)
+        (results_dir / "HearMeClassifier_flexible.mlpackage" / "Manifest.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeCoreClassifier_flexible.mlpackage").mkdir(parents=True)
+        (results_dir / "HearMeCoreClassifier_flexible.mlpackage" / "Manifest.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeClassifier.onnx").write_bytes(b"onnx-full")
+        (results_dir / "HearMeClassifier_metadata.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeCoreClassifier.onnx").write_bytes(b"onnx-core")
+        (results_dir / "HearMeCoreClassifier_metadata.json").write_text("{}", encoding="utf-8")
+
+        client = make_container_client([])
+        dry_stats = sync_classifier_artifacts(
+            client,
+            classifier_root=cls_root,
+            direction="push",
+            include_exports=True,
+            dry_run=True,
+        )
+        dry_no_exports = sync_classifier_artifacts(
+            client,
+            classifier_root=cls_root,
+            direction="push",
+            include_exports=False,
+            dry_run=True,
+        )
+        assert dry_no_exports["uploaded"] == 8
+        assert dry_stats["uploaded"] == 14  # +6 full and core CoreML/ONNX/metadata exports
+        assert dry_stats["errors"] == 0
+
 
 

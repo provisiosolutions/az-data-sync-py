@@ -63,8 +63,8 @@ Edit `config.json` with your values:
 ```json
 {
   "connection_string": "DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT;AccountKey=YOUR_KEY;EndpointSuffix=core.windows.net",
-  "container_name": "my-container",
-  "local_dir": "./synced-files",
+  "container_name": "raw-sessions",
+  "local_dir": "./raw-sessions",
   "prefix": "",
   "delete_orphaned": false
 }
@@ -113,17 +113,66 @@ python sync.py -c config.json --local-dir /data/backup
 | `--container` | | — | Blob container name |
 | `--local-dir` | | `./synced-files` | Local directory to sync into |
 | `--prefix` | | `""` | Only sync blobs matching this prefix |
-| `--delete-orphaned` | | `false` | Remove local files deleted from Azure |
+| `--delete-orphaned` | | `false` | Delete orphaned local files on pull or orphaned blobs on `--push` |
 | `--verify-local` | | `false` | Re-download blobs missing on disk even if manifest ETag matches |
 | `--push` | | `false` | Push local files to Azure Blob Storage instead of pulling |
-| `--classifier-root` | | — | Path to `audio-classifier-hear-me` root to push/pull dataset (106 MB), profile heads, and model weights |
+| `--classifier-root` | | — | Path to `audio-classifier-hear-me` root to push/pull dataset, profile heads, and model weights |
+| `--stage-from-classifier` | | — | Stage raw Kirk WAV sessions and trained speaker heads locally |
+| `--raw-sessions-dir` | | `./raw-sessions` | Local staging path for direct raw Kirk sessions |
+| `--trained-heads-dir` | | `./trained-heads` | Local staging path for trained speaker heads |
+| `--include-mp4` | | `false` | Include `.mp4` videos from `Edited_Clips` when staging raw sessions |
 | `--skip-exports` | | `false` | Skip heavy Core ML / ONNX export bundles when syncing `--classifier-root` |
 | `--dry-run` | | `false` | Preview files to upload without transferring data |
 | `--verbose` | `-v` | `false` | Enable debug-level logging |
+| `--tui` | | `false` | Launch the interactive Textual sync dashboard |
+
+## TUI Quickstart (`tui.py` / `--tui`)
+
+Launch the interactive dashboard to inspect datasets, preview diffs, and sync buckets without long CLI flags:
+
+```bash
+python sync.py --tui
+# Or run directly:
+python tui.py
+```
+
+1. **Copy Config:** Run `cp config.example.json config.json` and paste your Azure connection string.
+2. **Pick a Bucket:** Press `Up` or `Down` to select `raw-sessions`, `trained-heads`, or `sessions (SWA)`.
+3. **Inspect Words, Files, and Audio:** Press `/` to filter words or filenames (`Esc` clears), press `V` (or `1`/`2`/`3`) to switch `Words`, `Files`, and `Sync Diff` tabs, press `Enter` on a word to view matching files, and press `Space` to play/stop audio clips with a live waveform.
+4. **Sync Safely:** Press `G` to pull files, `S` to stage new clips from `../audio-classifier-hear-me`, `P` to push after preview, or `?` for the quickstart guide. (`sessions` stays Pull-Only.)
+
+## Three-Bucket Session & Trained-Head Layout
+
+Keep HearMe SWA web sessions, direct raw audio sessions, and trained speaker heads in separate directories and Azure containers:
+
+| Local Directory | Azure Container | Contents |
+| :--- | :--- | :--- |
+| `./synced-files/` | `sessions` | HearMe SWA web-app sessions (`metadata.json` + `.wav`) |
+| `./raw-sessions/` | `raw-sessions` | `snake_case` Kirk WAV sessions (`session_2026_08_25`, `session_2026_09_25`, `session_2026_11_18_edited_clips`), `manifest.jsonl`, `lexicon.json` |
+| `./trained-heads/` | `trained-heads` | Trained speaker heads (`kirk/`, `kirk_core/`) without audio symlinks |
+
+Stage and preview uploads before you push to Azure:
+
+```bash
+# 1. Pull HearMe SWA sessions into ./synced-files/ when real recordings arrive
+python sync.py -c config.json --container sessions --local-dir ./synced-files
+
+# 2. Stage snake_case raw WAV sessions, manifest.jsonl, lexicon.json, and heads locally
+python sync.py --stage-from-classifier ../audio-classifier-hear-me
+
+# 3. Pull or preview raw-sessions (default in config.json) and trained-heads
+python sync.py -c config.json
+python sync.py -c config.json --container raw-sessions --local-dir ./raw-sessions --push --delete-orphaned --dry-run
+python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push --delete-orphaned --dry-run
+
+# 4. Push to Azure when ready (creates containers on live upload)
+python sync.py -c config.json --container raw-sessions --local-dir ./raw-sessions --push --delete-orphaned
+python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push --delete-orphaned
+```
 
 ## Backing Up & Restoring HearMe Classifier Audio & Weights
 
-Push or restore the `audio-classifier-hear-me` dataset (`dataset/train` 990 WAVs, `manifest.jsonl`, `splits/`), speaker profile heads (`profiles/kirk/head.pt`), and model weights (`results/best_model`, Core ML `.mlpackage`, ONNX) under the `classifier/` prefix in Azure Blob Storage:
+Push or restore the `audio-classifier-hear-me` dataset (`dataset/train`, `manifest.jsonl`, `splits/`), speaker profile heads (`profiles/kirk/head.pt`, `profiles/kirk_core/head.pt`), and model weights (`results/best_model`, `results/best_model_core`, Core ML `.mlpackage`, ONNX) under the `classifier/` prefix:
 
 ```bash
 # Dry-run preview of classifier files to upload
@@ -165,7 +214,7 @@ The manifest is stored inside your `--local-dir`. Deleting it will cause a full 
 
 ```bash
 pip install pytest
-pytest test_sync.py -v
+pytest test_sync.py test_tui.py -v
 ```
 
 All Azure SDK calls are mocked — no real Azure connection needed.
