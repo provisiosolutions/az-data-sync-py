@@ -66,7 +66,14 @@ console = Console()
 # ---------------------------------------------------------------------------
 MANIFEST_FILE = ".sync_manifest.json"
 PUSH_MANIFEST_FILE = ".push_manifest.json"
-_IGNORED_FILENAMES = {MANIFEST_FILE, PUSH_MANIFEST_FILE, ".DS_Store", "Thumbs.db"}
+_IGNORED_FILENAMES = {
+    MANIFEST_FILE,
+    PUSH_MANIFEST_FILE,
+    ".DS_Store",
+    "Thumbs.db",
+    "hearme_dashboard.html",
+    "hearme_powerbi.xlsx",
+}
 
 
 def _normalize_etag(etag: str | None) -> str | None:

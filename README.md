@@ -137,8 +137,9 @@ python tui.py
 ```
 
 1. **Copy Config:** Run `cp config.example.json config.json` and paste your Azure connection string.
-2. **Pick a Bucket:** Press `Up` or `Down` to highlight `raw-sessions`, `trained-heads`, or `sessions (SWA)`.
-3. **Sync Safely:** Press `G` to pull files, `S` to stage new clips from `../audio-classifier-hear-me`, `P` to confirm and push, or `?` to open the Python/Pandas quickstart guide. (`sessions` stays Pull-Only.)
+2. **Pick a Bucket:** Press `Up` or `Down` to select `raw-sessions`, `trained-heads`, or `sessions (SWA)`.
+3. **Inspect Words and Files:** Press `/` to filter words or filenames (`Esc` clears), press `V` (or `1`/`2`/`3`) to switch `Words`, `Files`, and `Sync Diff` tabs, and press `Enter` on a word to view its matching files.
+4. **Sync Safely:** Press `G` to pull files, `S` to stage new clips from `../audio-classifier-hear-me`, `P` to push after preview, or `?` for the quickstart guide. (`sessions` stays Pull-Only.)
 
 ## Three-Bucket Session & Trained-Head Layout
 

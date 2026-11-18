@@ -10,12 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from textual.widgets import Button, DataTable, Static
+from textual.widgets import DataTable, Input, Static, TabbedContent
 
 from sync import MANIFEST_FILE, PUSH_MANIFEST_FILE, save_manifest
 from sync_inspector import (
     compute_bucket_diff,
     default_bucket_specs,
+    derive_remote_raw_words,
     get_dataset_summary,
     get_heads_and_upstream_summary,
     scan_local_dir,
@@ -158,6 +159,34 @@ def test_compute_bucket_diff_modes(tmp_path: Path):
     assert pulled_diff.to_download == []
 
 
+def test_scan_local_dir_skips_dashboard_exports(tmp_path: Path):
+    synced_dir = tmp_path / "synced-files"
+    synced_dir.mkdir(parents=True)
+    (synced_dir / "hearme_dashboard.html").write_text("<html></html>", encoding="utf-8")
+    (synced_dir / "hearme_powerbi.xlsx").write_bytes(b"xlsx-bytes")
+    (synced_dir / "review.html").write_text("<html></html>", encoding="utf-8")
+
+    scan = scan_local_dir(synced_dir)
+    assert scan.exists is True
+    assert scan.file_count == 0
+    assert scan.total_bytes == 0
+
+
+def test_derive_remote_raw_words():
+    remote_files = {
+        "session_2026_08_25/all/all_01.wav": (32000, "2026-11-18T12:00:00+00:00"),
+        "session_2026_09_25/all/all_02.wav": (32000, "2026-11-18T12:00:00+00:00"),
+        "session_2026_11_18_edited_clips/bless_you/bless_you_01.wav": (64000, "2026-11-18T12:00:00+00:00"),
+        "manifest.jsonl": (1024, "2026-11-18T12:00:00+00:00"),
+    }
+    words = derive_remote_raw_words(remote_files)
+    assert [w.label for w in words] == ["all", "bless_you"]
+    assert words[0].clip_count == 2
+    assert words[0].sessions == ("08_25", "09_25")
+    assert words[1].display_text == "Bless you"
+    assert words[1].sessions == ("11_18",)
+
+
 def test_tui_offline_boot_and_guide_modal(tmp_path: Path):
     _seed_workspace(tmp_path, with_classifier=False)
 
@@ -170,14 +199,18 @@ def test_tui_offline_boot_and_guide_modal(tmp_path: Path):
         )
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause(0.05)
+            assert len(app.query("#action-bar")) == 0
             table = app.query_one("#buckets-table", DataTable)
             assert table.row_count == 3
-            assert app.query_one("#btn-push", Button).disabled is True
-            assert app.query_one("#btn-stage", Button).disabled is True
+            assert app.check_action("pull_selected", ()) is None
+            assert app.check_action("push_selected", ()) is None
+            assert app.check_action("stage_classifier", ()) is None
+            assert app.check_action("open_review", ()) is None
+
             banner_text = str(app.query_one("#workflow-banner", Static).render())
             assert "Offline" in banner_text
-            assert "[G] Pull" in banner_text
-            assert str(app.query_one("#btn-pull", Button).label) == "Pull [G]"
+            assert app.query_one("#words-table", DataTable).row_count == 1
+            assert app.query_one("#files-table", DataTable).row_count == 3
 
             await pilot.press("?")
             await pilot.pause(0.05)
@@ -238,7 +271,10 @@ def test_tui_mock_azure_diff_navigation_and_confirm_modal(tmp_path: Path):
             assert app._diffs["raw-sessions"].status_label == "↑ 1 to push"
             assert app._diffs["trained-heads"].status_label == "● In Sync"
             assert app._diffs["sessions"].status_label == "● Empty (Ready)"
-            assert app.query_one("#btn-push", Button).disabled is False
+            assert app.check_action("push_selected", ()) is True
+            assert app.check_action("pull_selected", ()) is True
+            assert app.check_action("stage_classifier", ()) is True
+            assert app.check_action("open_review", ()) is None
 
             # Pressing 'p' opens ConfirmSyncModal with upload preview; Esc cancels
             await pilot.press("p")
@@ -248,12 +284,133 @@ def test_tui_mock_azure_diff_navigation_and_confirm_modal(tmp_path: Path):
             await pilot.pause(0.05)
             assert not isinstance(app.screen, ConfirmSyncModal)
 
-            # Navigate down twice to 'sessions' (Pull-Only): Push button must disable
+            # Navigate down twice to 'sessions' (Pull-Only): push action dims in Footer
             table = app.query_one("#buckets-table", DataTable)
             table.focus()
             await pilot.press("down", "down")
             await pilot.pause(0.05)
             assert app._selected_key == "sessions"
-            assert app.query_one("#btn-push", Button).disabled is True
+            assert app.check_action("push_selected", ()) is None
 
     asyncio.run(_run())
+
+
+def test_tui_words_files_filter_drilldown_and_remote_fallback(tmp_path: Path):
+    _seed_workspace(tmp_path, with_classifier=False)
+
+    # Expand lexicon with one unrecorded word + add kirk_core head profile
+    lex_path = tmp_path / "raw-sessions" / "lexicon.json"
+    lex_path.write_text(
+        json.dumps(
+            {
+                "phrases": [
+                    {"id": "all", "display_text": "All"},
+                    {"id": "bless_you", "display_text": "Bless you"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    core_dir = tmp_path / "trained-heads" / "kirk_core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "head.pt").write_bytes(b"core-pt")
+    (core_dir / "labels.json").write_text(json.dumps(["bless_you"]), encoding="utf-8")
+    (core_dir / "calibration.json").write_text(
+        json.dumps({"default_threshold": 0.25, "per_class_thresholds": {"bless_you": 0.30}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "trained-heads" / "kirk" / "labels.json").write_text(
+        json.dumps(["all", "bless_you"]),
+        encoding="utf-8",
+    )
+
+    async def _run():
+        app = HearMeSyncApp(
+            repo_root=tmp_path,
+            config_path=tmp_path / "missing.json",
+            classifier_root=tmp_path / "missing-cls",
+            auto_connect=False,
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause(0.05)
+            words_table = app.query_one("#words-table", DataTable)
+            files_table = app.query_one("#files-table", DataTable)
+            tabs = app.query_one("#inspector-tabs", TabbedContent)
+            filter_input = app.query_one("#inspector-filter", Input)
+
+            assert words_table.row_count == 2  # 'all' (1 take) + 'bless_you' (0 takes)
+            assert files_table.row_count == 3
+
+            # Press '/' to focus filter and narrow both tables to 'bless'
+            await pilot.press("slash")
+            await pilot.pause(0.05)
+            filter_input.value = "bless"
+            await pilot.pause(0.05)
+            assert words_table.row_count == 1
+            assert files_table.row_count == 1  # No WAV matches 'bless', empty notice row
+
+            # Clear with Escape and return focus to buckets
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+            assert filter_input.value == ""
+            assert words_table.row_count == 2
+
+            # Drill down from 'all' word row into Files tab
+            words_table.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert tabs.active == "tab-files"
+            assert filter_input.value == "/all/"
+            assert files_table.row_count == 1  # session_2026_08_25/all/all_01.wav
+
+            # Reset filter via Escape, switch to trained-heads, verify kirk_core comes first
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+            await pilot.press("v")  # tab-files -> tab-diff
+            await pilot.pause(0.05)
+            assert tabs.active == "tab-diff"
+            await pilot.press("v")  # tab-diff -> tab-words
+            await pilot.pause(0.05)
+            assert tabs.active == "tab-words"
+
+            buckets = app.query_one("#buckets-table", DataTable)
+            buckets.focus()
+            await pilot.press("down")
+            await pilot.pause(0.05)
+            assert app._selected_key == "trained-heads"
+            assert words_table.row_count == 2
+            first_word_cell = str(words_table.get_cell_at((0, 1)))
+            assert first_word_cell == "bless_you"
+
+    asyncio.run(_run())
+
+    # Remote-only raw-sessions fallback when local manifest.jsonl is absent
+    (tmp_path / "raw-sessions" / "manifest.jsonl").unlink()
+    mock_service = _make_mock_blob_service(
+        {
+            "raw-sessions": [
+                _make_blob("session_2026_08_25/goodnight/goodnight_01.wav", etag="0x1", size=12000)
+            ],
+            "trained-heads": [],
+            "sessions": [],
+        }
+    )
+
+    async def _run_remote_fallback():
+        app = HearMeSyncApp(
+            repo_root=tmp_path,
+            config_path=tmp_path / "config.json",
+            classifier_root=tmp_path / "missing-cls",
+            blob_service=mock_service,
+            auto_connect=False,
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            for _ in range(30):
+                await pilot.pause(0.05)
+                if not app._diffs["raw-sessions"].offline:
+                    break
+            words_table = app.query_one("#words-table", DataTable)
+            assert words_table.row_count == 1
+            assert str(words_table.get_cell_at((0, 1))) == "goodnight"
+
+    asyncio.run(_run_remote_fallback())
