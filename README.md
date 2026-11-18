@@ -163,11 +163,11 @@ python sync.py --stage-from-classifier ../audio-classifier-hear-me
 # 3. Pull or preview raw-sessions (default in config.json) and trained-heads
 python sync.py -c config.json
 python sync.py -c config.json --container raw-sessions --local-dir ./raw-sessions --push --delete-orphaned --dry-run
-python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push --dry-run
+python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push --delete-orphaned --dry-run
 
 # 4. Push to Azure when ready (creates containers on live upload)
 python sync.py -c config.json --container raw-sessions --local-dir ./raw-sessions --push --delete-orphaned
-python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push
+python sync.py -c config.json --container trained-heads --local-dir ./trained-heads --push --delete-orphaned
 ```
 
 ## Backing Up & Restoring HearMe Classifier Audio & Weights

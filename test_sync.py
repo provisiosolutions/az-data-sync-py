@@ -915,5 +915,58 @@ class TestStageRawSessionsAndHeads:
             is True
         )
 
+    def test_stage_trained_heads_prunes_stale_checkpoints_and_syncs_core_exports(self, tmp_path):
+        cls_root = self._build_classifier_fixture(tmp_path)
+        kirk_ckpts = cls_root / "profiles" / "kirk" / "checkpoints"
+        kirk_ckpts.mkdir(parents=True)
+        (cls_root / "profiles" / "kirk" / "head.pt").write_bytes(b"kirk-new-head")
+        (kirk_ckpts / "head_new.pt").write_bytes(b"new-ckpt")
+
+        dest_dir = tmp_path / "trained-heads"
+        stale_ckpt = dest_dir / "kirk" / "checkpoints" / "stale_old.pt"
+        stale_ckpt.parent.mkdir(parents=True)
+        stale_ckpt.write_bytes(b"stale-ckpt")
+        (dest_dir / ".push_manifest.json").write_text("{}", encoding="utf-8")
+
+        stats = stage_trained_heads(cls_root, dest_dir)
+        assert stats["copied"] == 2
+        assert stats["removed_stale"] == 1
+        assert not stale_ckpt.exists()
+        assert (dest_dir / ".push_manifest.json").is_file()
+        assert (dest_dir / "kirk" / "checkpoints" / "head_new.pt").is_file()
+
+        results_dir = cls_root / "results"
+        (results_dir / "best_model").mkdir(parents=True)
+        (results_dir / "best_model" / "config.json").write_text("{}", encoding="utf-8")
+        (results_dir / "best_model_core").mkdir(parents=True)
+        (results_dir / "best_model_core" / "config.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeClassifier_flexible.mlpackage").mkdir(parents=True)
+        (results_dir / "HearMeClassifier_flexible.mlpackage" / "Manifest.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeCoreClassifier_flexible.mlpackage").mkdir(parents=True)
+        (results_dir / "HearMeCoreClassifier_flexible.mlpackage" / "Manifest.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeClassifier.onnx").write_bytes(b"onnx-full")
+        (results_dir / "HearMeClassifier_metadata.json").write_text("{}", encoding="utf-8")
+        (results_dir / "HearMeCoreClassifier.onnx").write_bytes(b"onnx-core")
+        (results_dir / "HearMeCoreClassifier_metadata.json").write_text("{}", encoding="utf-8")
+
+        client = make_container_client([])
+        dry_stats = sync_classifier_artifacts(
+            client,
+            classifier_root=cls_root,
+            direction="push",
+            include_exports=True,
+            dry_run=True,
+        )
+        dry_no_exports = sync_classifier_artifacts(
+            client,
+            classifier_root=cls_root,
+            direction="push",
+            include_exports=False,
+            dry_run=True,
+        )
+        assert dry_no_exports["uploaded"] == 8
+        assert dry_stats["uploaded"] == 14  # +6 full and core CoreML/ONNX/metadata exports
+        assert dry_stats["errors"] == 0
+
 
 

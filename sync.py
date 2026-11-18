@@ -71,9 +71,8 @@ _IGNORED_FILENAMES = {
     PUSH_MANIFEST_FILE,
     ".DS_Store",
     "Thumbs.db",
-    "hearme_dashboard.html",
-    "hearme_powerbi.xlsx",
 }
+_IGNORED_EXTENSIONS = (".tmp", ".html", ".xlsx")
 
 
 def _normalize_etag(etag: str | None) -> str | None:
@@ -390,7 +389,7 @@ def push_directory(
             if d != "__pycache__" and not (root_path / d).is_symlink()
         ]
         for fname in sorted(files):
-            if fname in _IGNORED_FILENAMES or fname.endswith(".tmp"):
+            if fname in _IGNORED_FILENAMES or fname.endswith(_IGNORED_EXTENSIONS):
                 continue
             fpath = root_path / fname
             if fpath.is_symlink():
@@ -989,13 +988,14 @@ def build_swa_phrase_seeds(
 def stage_trained_heads(classifier_root: Path, dest_dir: Path) -> dict:
     """
     Stage trained speaker heads and profile metadata from classifier_root/profiles/
-    into dest_dir while skipping audio_data directories and symlinks.
+    into dest_dir while skipping audio_data directories and symlinks and pruning stale files.
     """
-    stats: dict = {"copied": 0, "unchanged": 0, "profiles": {}}
+    stats: dict = {"copied": 0, "unchanged": 0, "removed_stale": 0, "profiles": {}}
     profiles_root = classifier_root / "profiles"
     if not profiles_root.is_dir():
         return stats
 
+    expected_rel_paths: set[Path] = set()
     for root, dirs, files in os.walk(profiles_root, followlinks=False):
         root_path = Path(root)
         dirs[:] = [
@@ -1004,18 +1004,42 @@ def stage_trained_heads(classifier_root: Path, dest_dir: Path) -> dict:
             if d not in {"__pycache__", "audio_data"} and not (root_path / d).is_symlink()
         ]
         for fname in sorted(files):
-            if fname in _IGNORED_FILENAMES or fname.endswith(".tmp"):
+            if fname in _IGNORED_FILENAMES or fname.endswith(_IGNORED_EXTENSIONS):
                 continue
             fpath = root_path / fname
             if fpath.is_symlink():
                 continue
             rel = fpath.relative_to(profiles_root)
+            expected_rel_paths.add(rel)
             profile_name = rel.parts[0]
             if _copy_if_changed(fpath, dest_dir / rel):
                 stats["copied"] += 1
             else:
                 stats["unchanged"] += 1
             stats["profiles"][profile_name] = stats["profiles"].get(profile_name, 0) + 1
+
+    if dest_dir.is_dir():
+        for root, dirs, files in os.walk(dest_dir, topdown=False, followlinks=False):
+            root_path = Path(root)
+            for fname in sorted(files):
+                if fname in _IGNORED_FILENAMES:
+                    continue
+                fpath = root_path / fname
+                rel = fpath.relative_to(dest_dir)
+                if fpath.is_symlink() or rel not in expected_rel_paths:
+                    fpath.unlink()
+                    stats["removed_stale"] += 1
+            for dname in sorted(dirs):
+                dpath = root_path / dname
+                if dpath.is_symlink():
+                    dpath.unlink()
+                    stats["removed_stale"] += 1
+                else:
+                    try:
+                        if not any(dpath.iterdir()):
+                            dpath.rmdir()
+                    except OSError:
+                        pass
 
     return stats
 
@@ -1042,11 +1066,17 @@ def sync_classifier_artifacts(
         (classifier_root / "results" / "best_model_core", f"{base_prefix}/results/best_model_core"),
     ]
     if include_exports:
-        targets.append(
-            (
-                classifier_root / "results" / "HearMeClassifier_flexible.mlpackage",
-                f"{base_prefix}/results/HearMeClassifier_flexible.mlpackage",
-            )
+        targets.extend(
+            [
+                (
+                    classifier_root / "results" / "HearMeClassifier_flexible.mlpackage",
+                    f"{base_prefix}/results/HearMeClassifier_flexible.mlpackage",
+                ),
+                (
+                    classifier_root / "results" / "HearMeCoreClassifier_flexible.mlpackage",
+                    f"{base_prefix}/results/HearMeCoreClassifier_flexible.mlpackage",
+                ),
+            ]
         )
 
     totals = {"uploaded": 0, "downloaded": 0, "skipped": 0, "deleted": 0, "errors": 0}
@@ -1065,12 +1095,14 @@ def sync_classifier_artifacts(
                 for k in ("uploaded", "skipped", "errors"):
                     totals[k] += sub.get(k, 0)
 
-        # Also push single-file exports (HearMeClassifier.onnx, metadata, parity_baseline)
+        # Also push single-file exports (ONNX, metadata, parity_baseline)
         if include_exports:
             results_dir = classifier_root / "results"
             for single_name in (
                 "HearMeClassifier.onnx",
                 "HearMeClassifier_metadata.json",
+                "HearMeCoreClassifier.onnx",
+                "HearMeCoreClassifier_metadata.json",
                 "parity_baseline.json",
             ):
                 fpath = results_dir / single_name
@@ -1310,7 +1342,8 @@ def main() -> None:
         )
         stage_table.add_row(
             f"trained-heads ({args.trained_heads_dir})",
-            f"copied={head_stats['copied']}, unchanged={head_stats['unchanged']} | {heads_summary}",
+            f"copied={head_stats['copied']}, unchanged={head_stats['unchanged']}, "
+            f"removed_stale={head_stats['removed_stale']} | {heads_summary}",
         )
         console.print()
         console.print(Panel(stage_table, expand=False, border_style="blue"))

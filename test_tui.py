@@ -167,8 +167,8 @@ def test_compute_bucket_diff_modes(tmp_path: Path):
 def test_scan_local_dir_skips_dashboard_exports(tmp_path: Path):
     synced_dir = tmp_path / "synced-files"
     synced_dir.mkdir(parents=True)
-    (synced_dir / "hearme_dashboard.html").write_text("<html></html>", encoding="utf-8")
-    (synced_dir / "hearme_powerbi.xlsx").write_bytes(b"xlsx-bytes")
+    (synced_dir / "local_report.html").write_text("<html></html>", encoding="utf-8")
+    (synced_dir / "local_workbook.xlsx").write_bytes(b"xlsx-bytes")
     (synced_dir / "review.html").write_text("<html></html>", encoding="utf-8")
 
     scan = scan_local_dir(synced_dir)

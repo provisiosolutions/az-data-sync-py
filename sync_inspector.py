@@ -25,7 +25,8 @@ from sync import (
 )
 
 _ACCOUNT_NAME_RE = re.compile(r"(?:^|;)AccountName=([^;]+)", re.IGNORECASE)
-_SKIP_SCAN_FILES = _IGNORED_FILENAMES | {"review.html", "hearme_dashboard.html", "hearme_powerbi.xlsx"}
+_SKIP_SCAN_FILES = _IGNORED_FILENAMES
+_SKIP_SCAN_EXTENSIONS = (".tmp", ".html", ".xlsx")
 _SESSION_DATE_RE = re.compile(r"^session_\d{4}_(\d{2}_\d{2})(?:_|$)")
 _HEAD_FILE_ROLES = {
     "head.pt": "Head Weights",
@@ -225,7 +226,7 @@ def default_bucket_specs(repo_root: Path) -> list[BucketSpec]:
             container="trained-heads",
             local_dir=repo_root / "trained-heads",
             pull_only=False,
-            delete_orphaned_on_push=False,
+            delete_orphaned_on_push=True,
             subtitle="Trained speaker heads (kirk 137-class & kirk_core 30-class)",
         ),
         BucketSpec(
@@ -291,7 +292,7 @@ def scan_local_dir(local_dir: Path) -> LocalScanResult:
                 continue
             if not entry.is_file(follow_symlinks=False):
                 continue
-            if name in _SKIP_SCAN_FILES or name.endswith(".tmp"):
+            if name in _SKIP_SCAN_FILES or name.endswith(_SKIP_SCAN_EXTENSIONS):
                 continue
             stat = entry.stat(follow_symlinks=False)
             files[rel_posix] = (stat.st_size, stat.st_mtime_ns)
