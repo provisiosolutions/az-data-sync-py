@@ -24,7 +24,7 @@
 - [x] **Test Coverage (`test_sync.py`, `test_tui.py`)**:
   - Added 10 unit tests in `TestStageRawSessionsAndHeads` (`36` $\to$ `46` passing tests in `test_sync.py`) and 8 Textual/inspector tests in `test_tui.py`.
 
-- [x] **Performant Student Sync Dashboard (`tui.py`, `sync_inspector.py`, `sync.py --tui`)**:
+- [x] **Performant Textual Sync Dashboard (`tui.py`, `sync_inspector.py`, `sync.py --tui`)**:
   - Added `sync_inspector.py` (`18.5 ms` local scan, `0.04 ms` cached summary, `428 ms` parallel 3-bucket Azure diff).
   - Built `tui.py` with single clickable `Footer` actions (`check_action`), right-pane `Words` / `Files` / `Sync Diff` tabs, live `/` filter, and `Enter` drill-down (`11.0 ms` switch).
   - Excluded `hearme_dashboard.html` and `hearme_powerbi.xlsx` from SWA scans (`sessions` stays `Local: 0`).

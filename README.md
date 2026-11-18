@@ -126,7 +126,7 @@ python sync.py -c config.json --local-dir /data/backup
 | `--verbose` | `-v` | `false` | Enable debug-level logging |
 | `--tui` | | `false` | Launch the interactive Textual sync dashboard |
 
-## Student TUI Quickstart (`tui.py` / `--tui`)
+## TUI Quickstart (`tui.py` / `--tui`)
 
 Launch the interactive dashboard to inspect datasets, preview diffs, and sync buckets without long CLI flags:
 

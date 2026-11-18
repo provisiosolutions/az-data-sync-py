@@ -165,7 +165,7 @@ Screen {
     margin-top: 1;
 }
 
-ConfirmSyncModal, StudentGuideModal {
+ConfirmSyncModal, QuickstartGuideModal {
     align: center middle;
 }
 
@@ -245,8 +245,8 @@ class ConfirmSyncModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class StudentGuideModal(ModalScreen[None]):
-    """Quick onboarding & Pandas/PyTorch usage cheat sheet for students."""
+class QuickstartGuideModal(ModalScreen[None]):
+    """Quickstart and dataset loading reference modal."""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
@@ -262,7 +262,7 @@ class StudentGuideModal(ModalScreen[None]):
                 "  • [bold]trained-heads[/bold]  → Lightweight speaker heads (kirk 137-class, kirk_core 30-class)",
                 "  • [bold]sessions (SWA)[/bold] → Web app participant recordings (Pull-Only safety lock)",
                 "",
-                "[bold cyan]2. First-Time Setup on Your Laptop[/bold cyan]",
+                "[bold cyan]2. Local Setup[/bold cyan]",
                 "  1) Copy [bold]config.example.json[/bold] to [bold]config.json[/bold] and add the Azure connection string.",
                 "  2) Select [bold]raw-sessions[/bold] and press [bold]G (Pull)[/bold] to download training audio.",
                 "  3) Select [bold]trained-heads[/bold] and press [bold]G (Pull)[/bold] to download head weights.",
@@ -283,7 +283,7 @@ class StudentGuideModal(ModalScreen[None]):
             ]
         )
         with Vertical(id="guide-dialog"):
-            yield Static("[bold]HearMe Data Sync — Student Quickstart Guide[/bold]")
+            yield Static("[bold]HearMe Data Sync — Quickstart Guide[/bold]")
             with VerticalScroll(id="guide-scroll"):
                 yield Static(guide)
             with Horizontal(id="modal-buttons"):
@@ -1121,7 +1121,7 @@ class HearMeSyncApp(App):
         self.action_activate_tab("tab-diff")
 
     def action_show_guide(self) -> None:
-        self.push_screen(StudentGuideModal())
+        self.push_screen(QuickstartGuideModal())
 
     def action_pull_selected(self) -> None:
         if self._busy_transfer:

@@ -21,7 +21,7 @@ from sync_inspector import (
     get_heads_and_upstream_summary,
     scan_local_dir,
 )
-from tui import ConfirmSyncModal, HearMeSyncApp, StudentGuideModal
+from tui import ConfirmSyncModal, HearMeSyncApp, QuickstartGuideModal
 
 
 def _make_blob(name: str, etag: str = "0x1", size: int = 100):
@@ -214,11 +214,11 @@ def test_tui_offline_boot_and_guide_modal(tmp_path: Path):
 
             await pilot.press("?")
             await pilot.pause(0.05)
-            assert isinstance(app.screen, StudentGuideModal)
+            assert isinstance(app.screen, QuickstartGuideModal)
 
             await pilot.press("escape")
             await pilot.pause(0.05)
-            assert not isinstance(app.screen, StudentGuideModal)
+            assert not isinstance(app.screen, QuickstartGuideModal)
 
     asyncio.run(_run())
 
