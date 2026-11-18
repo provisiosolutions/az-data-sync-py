@@ -30,7 +30,8 @@ from textual.widgets import (
     TabPane,
 )
 
-from review_sessions import discover_sessions, generate_html
+from audio_preview import AudioPlayer, extract_wav_waveform, render_waveform_line
+from review_sessions import canonicalize_phrase_id, discover_sessions, generate_html
 from sync import (
     push_directory,
     stage_classifier_raw_sessions,
@@ -158,7 +159,7 @@ Screen {
 
 #inspector-detail {
     height: auto;
-    min-height: 2;
+    min-height: 4;
     border: round $primary-lighten-2;
     background: $panel;
     padding: 0 1;
@@ -267,10 +268,11 @@ class QuickstartGuideModal(ModalScreen[None]):
                 "  2) Select [bold]raw-sessions[/bold] and press [bold]G (Pull)[/bold] to download training audio.",
                 "  3) Select [bold]trained-heads[/bold] and press [bold]G (Pull)[/bold] to download head weights.",
                 "",
-                "[bold cyan]3. Browse Words, Phrases, and Files[/bold cyan]",
+                "[bold cyan]3. Browse Words, Phrases, Files, and Audio[/bold cyan]",
                 "  • Press [bold]/[/bold] to filter words, class labels, or WAV filenames live ([bold]Esc[/bold] clears).",
                 "  • Press [bold]V[/bold] (or [bold]1[/bold]/[bold]2[/bold]/[bold]3[/bold]) to switch Words, Files, and Sync Diff tabs.",
                 "  • Press [bold]Enter[/bold] on a word row to jump straight to its matching WAV/profile files.",
+                "  • Press [bold]Space[/bold] to play/stop audio clips (or cycle takes) with a live waveform.",
                 "",
                 "[bold cyan]4. Load Raw Audio & Labels in Python / Pandas[/bold cyan]",
                 '  [green]import pandas as pd[/green]',
@@ -302,6 +304,7 @@ class HearMeSyncApp(App):
     TITLE = "HearMe Data Sync Studio"
     CSS = APP_CSS
     BINDINGS = [
+        Binding("space", "toggle_audio", "Play", key_display="Space"),
         Binding("g", "pull_selected", "Pull"),
         Binding("p", "push_selected", "Push"),
         Binding("s", "stage_classifier", "Stage"),
@@ -326,6 +329,7 @@ class HearMeSyncApp(App):
         classifier_root: Path | None = None,
         blob_service=None,
         auto_connect: bool = True,
+        audio_player: AudioPlayer | None = None,
     ) -> None:
         super().__init__()
         self.repo_root = (repo_root or Path(__file__).parent).resolve()
@@ -347,6 +351,14 @@ class HearMeSyncApp(App):
         self._dataset_summary = DatasetSummary()
         self._heads_summary = HeadsAndUpstreamSummary()
         self._swa_summary = SwaSummary()
+
+        self._raw_wavs_by_label: dict[str, list[Path]] = {}
+        self._swa_wavs_by_phrase: dict[str, list[Path]] = {}
+        self._word_wav_paths: dict[str, list[Path]] = {}
+        self._word_take_cursor: dict[str, int] = {}
+        self._last_played_word_key: str | None = None
+        self._audio_player = audio_player or AudioPlayer()
+        self._play_timer = None
 
         self._filter_query: str = ""
         self._word_detail_by_key: dict[str, str] = {}
@@ -427,12 +439,19 @@ class HearMeSyncApp(App):
             self.refresh_remote_worker()
 
     def on_unmount(self) -> None:
+        self._stop_play_timer()
+        self._audio_player.stop()
         self._detach_log_capture()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Enable or gray out Footer shortcuts dynamically based on bucket & state."""
         online = self._blob_service is not None
         spec = self._spec_by_key.get(self._selected_key)
+        if action == "toggle_audio":
+            if self._audio_player.is_playing():
+                return True
+            wav_path, _, _ = self._resolve_preview_wav()
+            return True if wav_path is not None else None
         if action == "pull_selected":
             return True if (online and not self._busy_transfer) else None
         if action == "push_selected":
@@ -518,6 +537,39 @@ class HearMeSyncApp(App):
             self.repo_root / "synced-files",
             local_scan=self._local_scans.get("sessions"),
         )
+        self._rebuild_wav_lookup()
+
+    def _rebuild_wav_lookup(self) -> None:
+        raw_dir = self.repo_root / "raw-sessions"
+        raw_scan = self._local_scans.get("raw-sessions")
+        raw_map: dict[str, list[Path]] = {}
+        if raw_scan is not None and raw_scan.exists:
+            clips_by_path = self._dataset_summary.clips_by_path
+            for rel_path in sorted(raw_scan.files):
+                if not rel_path.lower().endswith(".wav"):
+                    continue
+                clip_meta = clips_by_path.get(rel_path)
+                if clip_meta is not None and clip_meta.label:
+                    label = clip_meta.label
+                else:
+                    parts = Path(rel_path).parts
+                    if len(parts) < 3:
+                        continue
+                    label = parts[1]
+                raw_map.setdefault(label, []).append(raw_dir / rel_path)
+        self._raw_wavs_by_label = raw_map
+
+        synced_dir = self.repo_root / "synced-files"
+        swa_map: dict[str, list[Path]] = {}
+        if self._swa_summary.session_count > 0:
+            for rel_path, (display_text, _detail) in sorted(self._swa_summary.file_phrases.items()):
+                if not rel_path.lower().endswith(".wav"):
+                    continue
+                candidate = synced_dir / rel_path
+                if candidate.is_file():
+                    pid = canonicalize_phrase_id(display_text or Path(rel_path).stem)
+                    swa_map.setdefault(pid, []).append(candidate)
+        self._swa_wavs_by_phrase = swa_map
 
     @work(thread=True, exclusive=True, group="refresh")
     def refresh_remote_worker(self) -> None:
@@ -561,6 +613,7 @@ class HearMeSyncApp(App):
             self._heads_summary = heads_summary
             self._swa_summary = swa_summary
             self._diffs = diffs
+            self._rebuild_wav_lookup()
             self._render_all()
             self._write_log_line(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim] [green]{escape(log_msg)}[/green]")
 
@@ -709,6 +762,7 @@ class HearMeSyncApp(App):
         q = self._filter_query
         self._word_detail_by_key = {}
         self._word_drill_filter = {}
+        self._word_wav_paths = {}
 
         if spec.key == "raw-sessions":
             if self._words_col_mode != "raw-sessions":
@@ -764,6 +818,9 @@ class HearMeSyncApp(App):
                     key=row_key,
                 )
                 if recorded and not remote_only:
+                    wavs = self._raw_wavs_by_label.get(w.label, [])
+                    if wavs:
+                        self._word_wav_paths[row_key] = wavs
                     self._word_detail_by_key[row_key] = (
                         f'{w.label} ("{w.display_text}") — {w.clip_count} WAV takes '
                         f'({w.total_duration_s:.1f}s) in {", ".join(w.sessions)} · Press Enter for WAV files'
@@ -819,6 +876,9 @@ class HearMeSyncApp(App):
                     key=row_key,
                 )
                 target_profile = "kirk_core/" if is_core else f"{w.profiles[0]}/"
+                wavs = self._raw_wavs_by_label.get(w.label, [])
+                if wavs:
+                    self._word_wav_paths[row_key] = wavs
                 self._word_detail_by_key[row_key] = (
                     f'{w.label} ("{w.display_text}") — Profiles: {profiles_str} · '
                     f'{w.take_count} takes · threshold {thresh_str} · Press Enter for profile files'
@@ -860,6 +920,9 @@ class HearMeSyncApp(App):
                 Text(w.sample_feedback, style="dim"),
                 key=row_key,
             )
+            wavs = self._swa_wavs_by_phrase.get(w.phrase_id, [])
+            if wavs:
+                self._word_wav_paths[row_key] = wavs
             self._word_detail_by_key[row_key] = (
                 f'{w.phrase_id} ("{w.display_text}") — {w.recording_count} SWA recordings '
                 f'across {w.session_count} sessions · Press Enter for session files'
@@ -997,10 +1060,107 @@ class HearMeSyncApp(App):
         val = getattr(cell_key.row_key, "value", None)
         return val if isinstance(val, str) else None
 
+    def _resolve_preview_wav(self) -> tuple[Path | None, str, str | None]:
+        """Resolve the highlighted WAV clip (file row or current word take), if any."""
+        if not self.is_mounted:
+            return None, "", None
+        try:
+            active_tab = self.query_one("#inspector-tabs", TabbedContent).active
+        except Exception:
+            return None, "", None
+
+        spec = self._spec_by_key[self._selected_key]
+        if active_tab == "tab-files":
+            key = self._highlighted_row_key("files-table")
+            if not key or not key.startswith("file:"):
+                return None, "", None
+            rel_path = key[5:]
+            if not rel_path.lower().endswith(".wav"):
+                return None, "", None
+            candidate = spec.local_dir / rel_path
+            if candidate.is_file():
+                return candidate, rel_path, None
+            return None, f"{rel_path} (remote only — press G to pull before playing)", None
+
+        if active_tab == "tab-words":
+            key = self._highlighted_row_key("words-table")
+            if not key or key not in self._word_wav_paths:
+                return None, "", None
+            wavs = self._word_wav_paths[key]
+            if not wavs:
+                return None, "", None
+            idx = self._word_take_cursor.get(key, 0) % len(wavs)
+            chosen = wavs[idx]
+            try:
+                rel_disp = str(chosen.relative_to(self.repo_root))
+            except ValueError:
+                rel_disp = str(chosen)
+            return chosen, f"Take {idx + 1}/{len(wavs)} · {rel_disp}", key
+
+        return None, "", None
+
+    def _stop_play_timer(self) -> None:
+        if self._play_timer is not None:
+            try:
+                self._play_timer.stop()
+            except Exception:
+                pass
+            self._play_timer = None
+
+    def _on_playback_tick(self) -> None:
+        if not self._audio_player.is_playing():
+            self._stop_play_timer()
+            self._update_detail_bar()
+            self.refresh_bindings()
+            return
+        self._update_detail_bar()
+
+    def _render_waveform_preview(self, wav_path: Path, caption: str, word_key: str | None) -> Text:
+        wf = extract_wav_waveform(wav_path)
+        playing_this = self._audio_player.active_path == wav_path
+
+        out = Text()
+        if playing_this:
+            out.append("▶ PLAYING ", style="bold bright_yellow")
+        else:
+            out.append("♪ AUDIO ", style="bold cyan")
+        out.append(caption, style="bold white")
+
+        if wf is not None:
+            ch_str = "mono" if wf.channels == 1 else "stereo" if wf.channels == 2 else f"{wf.channels}ch"
+            sr_str = f"{wf.sample_rate // 1000}kHz" if wf.sample_rate >= 1000 else f"{wf.sample_rate}Hz"
+            out.append(
+                f"  ·  {wf.duration_s:.2f}s · {sr_str} {ch_str} · Peak {wf.peak_dbfs:.1f} dBFS",
+                style="",
+            )
+
+        if playing_this:
+            out.append("  [Space: Stop]", style="dim")
+        elif word_key is not None:
+            out.append("  [Space: Play/Next take · Enter: Files]", style="dim")
+        else:
+            out.append("  [Space/Enter: Play]", style="dim")
+
+        out.append("\n  ")
+        if wf is not None:
+            progress = self._audio_player.progress() if playing_this else None
+            out.append_text(render_waveform_line(wf, progress=progress))
+        else:
+            out.append("(PCM waveform unavailable)", style="dim")
+        return out
+
     def _update_detail_bar(self, explicit_text: str | None = None) -> None:
         detail_widget = self.query_one("#inspector-detail", Static)
         if explicit_text is not None:
             detail_widget.update(escape(explicit_text))
+            return
+
+        wav_path, caption, word_key = self._resolve_preview_wav()
+        if wav_path is not None:
+            detail_widget.update(self._render_waveform_preview(wav_path, caption, word_key))
+            return
+        if caption:
+            detail_widget.update(f"[yellow]{escape(caption)}[/yellow]")
             return
 
         active_tab = self.query_one("#inspector-tabs", TabbedContent).active
@@ -1016,7 +1176,7 @@ class HearMeSyncApp(App):
                 return
 
         spec = self._spec_by_key[self._selected_key]
-        detail_widget.update(f"[dim]{escape(spec.title)}: Use ↑/↓ in tables, / to filter, V to switch view.[/dim]")
+        detail_widget.update(f"[dim]{escape(spec.title)}: Use ↑/↓ in tables, / to filter, V to switch view, Space to play.[/dim]")
 
     def _set_filter_value(self, new_value: str) -> None:
         self._filter_query = new_value.strip().lower()
@@ -1024,6 +1184,7 @@ class HearMeSyncApp(App):
         if filter_input.value != new_value:
             filter_input.value = new_value
         self._render_inspector()
+        self.refresh_bindings()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         key = getattr(event.row_key, "value", None)
@@ -1037,13 +1198,13 @@ class HearMeSyncApp(App):
                 self._render_inspector()
                 self.refresh_bindings()
         elif table_id == "words-table":
-            detail = self._word_detail_by_key.get(key)
-            if detail:
-                self._update_detail_bar(detail)
+            if key != self._last_played_word_key:
+                self._last_played_word_key = None
+            self._update_detail_bar()
+            self.refresh_bindings()
         elif table_id == "files-table":
-            detail = self._file_detail_by_key.get(key)
-            if detail:
-                self._update_detail_bar(detail)
+            self._update_detail_bar()
+            self.refresh_bindings()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         key = getattr(event.row_key, "value", None)
@@ -1063,6 +1224,10 @@ class HearMeSyncApp(App):
                 self.query_one("#inspector-tabs", TabbedContent).active = "tab-files"
                 self.query_one("#files-table", DataTable).focus()
                 self._update_detail_bar()
+                self.refresh_bindings()
+        elif table_id == "files-table":
+            if key.startswith("file:") and key.lower().endswith(".wav"):
+                self.action_toggle_audio()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "inspector-filter":
@@ -1072,6 +1237,7 @@ class HearMeSyncApp(App):
             return
         self._filter_query = normalized
         self._render_inspector()
+        self.refresh_bindings()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "inspector-filter":
@@ -1087,6 +1253,7 @@ class HearMeSyncApp(App):
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.tabbed_content.id == "inspector-tabs":
             self._update_detail_bar()
+            self.refresh_bindings()
 
     def on_key(self, event: events.Key) -> None:
         if event.key != "escape" or self.screen is not self.screen_stack[0]:
@@ -1098,6 +1265,42 @@ class HearMeSyncApp(App):
             self.query_one("#buckets-table", DataTable).focus()
             event.prevent_default()
             event.stop()
+
+    def action_toggle_audio(self) -> None:
+        if self._audio_player.is_playing():
+            was_active = self._audio_player.active_path
+            self._audio_player.stop()
+            self._stop_play_timer()
+            self._update_detail_bar()
+            self.refresh_bindings()
+            cur_wav, _, _ = self._resolve_preview_wav()
+            if cur_wav is None or cur_wav == was_active:
+                return
+
+        active_tab = self.query_one("#inspector-tabs", TabbedContent).active
+        if active_tab == "tab-words":
+            row_key = self._highlighted_row_key("words-table")
+            wavs = self._word_wav_paths.get(row_key or "", [])
+            if row_key and len(wavs) > 1 and self._last_played_word_key == row_key:
+                self._word_take_cursor[row_key] = (self._word_take_cursor.get(row_key, 0) + 1) % len(wavs)
+            self._last_played_word_key = row_key
+
+        wav_path, caption, _ = self._resolve_preview_wav()
+        if wav_path is None:
+            self.post_log(caption or "Select a word with local takes or a local .wav file to play.", level="WARNING")
+            return
+
+        wf = extract_wav_waveform(wav_path)
+        dur = wf.duration_s if wf is not None else 1.5
+        ok, info = self._audio_player.play(wav_path, duration_s=dur)
+        if not ok:
+            self.post_log(info, level="WARNING")
+            return
+
+        self._stop_play_timer()
+        self._play_timer = self.set_interval(0.08, self._on_playback_tick)
+        self._update_detail_bar()
+        self.refresh_bindings()
 
     def action_refresh_all(self) -> None:
         if not self._busy_transfer:
@@ -1266,7 +1469,7 @@ class HearMeSyncApp(App):
             )
             self.post_log(
                 f"Stage complete: raw copied={raw_stats['copied']} (stale pruned={raw_stats['removed_stale']}), "
-                f"heads copied={head_stats['copied']}.",
+                f"heads copied={head_stats['copied']} (stale pruned={head_stats['removed_stale']}).",
                 level="INFO",
             )
         except Exception as exc:

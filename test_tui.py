@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import json
+import math
 import os
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from rich.text import Text
 from textual.widgets import DataTable, Input, Static, TabbedContent
 
+from audio_preview import AudioPlayer, extract_wav_waveform, render_waveform_line
 from sync import MANIFEST_FILE, PUSH_MANIFEST_FILE, save_manifest
 from sync_inspector import (
     compute_bucket_diff,
@@ -414,3 +419,213 @@ def test_tui_words_files_filter_drilldown_and_remote_fallback(tmp_path: Path):
             assert str(words_table.get_cell_at((0, 1))) == "goodnight"
 
     asyncio.run(_run_remote_fallback())
+
+
+def _write_pcm16_wav(
+    path: Path,
+    *,
+    freq_hz: float = 440.0,
+    amplitude: float = 0.5,
+    duration_s: float = 0.25,
+    sample_rate: int = 16000,
+    channels: int = 1,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nframes = max(1, int(sample_rate * duration_s))
+    scale = int(32767 * max(0.0, min(1.0, amplitude)))
+    samples = array.array("h")
+    for i in range(nframes):
+        val = int(scale * math.sin(2.0 * math.pi * freq_hz * (i / sample_rate)))
+        for _ in range(channels):
+            samples.append(val)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+
+
+class _DummyAudioHandle:
+    def __init__(self) -> None:
+        self.alive = True
+        self.terminated = False
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.alive = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def test_extract_wav_waveform_and_silence_floor(tmp_path: Path):
+    tone_mono = tmp_path / "tone_mono.wav"
+    _write_pcm16_wav(tone_mono, amplitude=0.6, duration_s=0.3, sample_rate=16000, channels=1)
+    wf = extract_wav_waveform(tone_mono, num_bins=40)
+    assert wf is not None
+    assert len(wf.bins) == 40
+    assert max(wf.bins) > 0.8
+    assert wf.sample_rate == 16000
+    assert wf.channels == 1
+
+    rendered = render_waveform_line(wf, progress=0.5)
+    assert isinstance(rendered, Text)
+    assert any(ch in rendered.plain for ch in "▁▂▃▄▅▆▇█")
+
+    tone_stereo = tmp_path / "tone_stereo.wav"
+    _write_pcm16_wav(tone_stereo, amplitude=0.4, duration_s=0.2, sample_rate=48000, channels=2)
+    wf_stereo = extract_wav_waveform(tone_stereo, num_bins=32)
+    assert wf_stereo is not None
+    assert wf_stereo.channels == 2
+    assert wf_stereo.sample_rate == 48000
+
+    quiet_wav = tmp_path / "silence.wav"
+    _write_pcm16_wav(quiet_wav, amplitude=0.0005, duration_s=0.2, sample_rate=16000, channels=1)
+    wf_quiet = extract_wav_waveform(quiet_wav, num_bins=32)
+    assert wf_quiet is not None
+    assert max(wf_quiet.bins) < 0.1
+
+    corrupt_wav = tmp_path / "corrupt.wav"
+    corrupt_wav.write_bytes(b"not-a-wav")
+    assert extract_wav_waveform(corrupt_wav) is None
+
+
+def test_audio_player_mock_lifecycle(tmp_path: Path):
+    wav_a = tmp_path / "a.wav"
+    wav_b = tmp_path / "b.wav"
+    _write_pcm16_wav(wav_a)
+    _write_pcm16_wav(wav_b)
+
+    launched: list[tuple[Path, _DummyAudioHandle]] = []
+
+    def _runner(path: Path):
+        h = _DummyAudioHandle()
+        launched.append((path, h))
+        return h
+
+    player = AudioPlayer(runner=_runner)
+    ok, backend = player.play(wav_a, duration_s=0.25)
+    assert ok is True
+    assert backend == "mock"
+    assert player.is_playing() is True
+    assert player.active_path == wav_a
+
+    # Starting a second clip terminates the first handle before launching the second
+    ok2, _ = player.play(wav_b, duration_s=0.25)
+    assert ok2 is True
+    assert launched[0][1].terminated is True
+    assert player.active_path == wav_b
+
+    assert player.stop() is True
+    assert launched[1][1].terminated is True
+    assert player.is_playing() is False
+
+
+def test_tui_audio_preview_waveform_and_take_cycling(tmp_path: Path):
+    raw_dir = tmp_path / "raw-sessions"
+    wav_01 = raw_dir / "session_2026_08_25" / "all" / "all_01.wav"
+    wav_02 = raw_dir / "session_2026_08_25" / "all" / "all_02.wav"
+    _write_pcm16_wav(wav_01, freq_hz=440.0, amplitude=0.5, duration_s=0.35)
+    _write_pcm16_wav(wav_02, freq_hz=660.0, amplitude=0.7, duration_s=0.40)
+
+    rows = [
+        {
+            "path": "session_2026_08_25/all/all_01.wav",
+            "session_id": "session_2026_08_25",
+            "label": "all",
+            "display_text": "All",
+            "take_id": "01",
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_s": 0.35,
+            "size": wav_01.stat().st_size,
+        },
+        {
+            "path": "session_2026_08_25/all/all_02.wav",
+            "session_id": "session_2026_08_25",
+            "label": "all",
+            "display_text": "All",
+            "take_id": "02",
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_s": 0.40,
+            "size": wav_02.stat().st_size,
+        },
+    ]
+    (raw_dir / "manifest.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    (raw_dir / "lexicon.json").write_text(
+        json.dumps({"phrases": [{"id": "all", "display_text": "All"}]}),
+        encoding="utf-8",
+    )
+
+    played: list[tuple[Path, _DummyAudioHandle]] = []
+
+    def _runner(path: Path):
+        h = _DummyAudioHandle()
+        played.append((path, h))
+        return h
+
+    mock_player = AudioPlayer(runner=_runner)
+
+    async def _run():
+        app = HearMeSyncApp(
+            repo_root=tmp_path,
+            config_path=tmp_path / "missing.json",
+            classifier_root=tmp_path / "missing-cls",
+            auto_connect=False,
+            audio_player=mock_player,
+        )
+        async with app.run_test(size=(130, 38)) as pilot:
+            await pilot.pause(0.05)
+            detail_text = str(app.query_one("#inspector-detail", Static).render())
+            assert "Take 1/2" in detail_text
+            assert any(ch in detail_text for ch in "▁▂▃▄▅▆▇█")
+            assert app.check_action("toggle_audio", ()) is True
+
+            # Space #1 starts all_01.wav
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            assert len(played) == 1
+            assert played[0][0] == wav_01
+            assert mock_player.is_playing() is True
+
+            # Space #2 while playing stops all_01.wav
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            assert played[0][1].terminated is True
+            assert mock_player.is_playing() is False
+
+            # Space #3 advances to take 2 (all_02.wav)
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            assert len(played) == 2
+            assert played[1][0] == wav_02
+            assert mock_player.is_playing() is True
+
+            # Stop and verify typing Space inside filter input still inserts space characters
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            assert mock_player.is_playing() is False
+            filter_input = app.query_one("#inspector-filter", Input)
+            filter_input.focus()
+            await pilot.press("a", "space", "b")
+            await pilot.pause(0.05)
+            assert filter_input.value == "a b"
+            await pilot.press("escape")
+            await pilot.pause(0.05)
+
+            # Drill down to Files tab and press Enter on WAV row to trigger playback
+            app.query_one("#inspector-tabs", TabbedContent).active = "tab-files"
+            app._set_filter_value("all_01.wav")
+            files_table = app.query_one("#files-table", DataTable)
+            files_table.focus()
+            await pilot.pause(0.05)
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert len(played) == 3
+            assert played[2][0] == wav_01
+
+    asyncio.run(_run())

@@ -1,9 +1,9 @@
 # PROGRESS — Azure Blob Sync & HearMe Three-Bucket Bridge (`az-data-sync-py`)
 
 > **Active Sprint Window**: Separate SWA Sessions, Raw Kirk Sessions, and Trained Heads  
-> **Session Status**: ✅ **READY FOR HANDOFF** (`2026-11-18T16:47-05:00`)  
-> **Branch & Base SHA**: `feat/three-bucket-snake-case-sync` (`775e285`)  
-> **Environment Health**: 58/58 Pytest unit tests passing (`test_sync.py`, `test_tui.py`, `test_export_powerbi.py`)  
+> **Session Status**: ✅ **READY FOR HANDOFF** (`2026-11-18T17:08-05:00`)  
+> **Branch & Base SHA**: `feat/three-bucket-snake-case-sync` (`8048318`)  
+> **Environment Health**: 61/61 Pytest unit tests passing (`test_sync.py`, `test_tui.py`, `test_export_powerbi.py`)  
 > **Connected Repository**: [`../audio-classifier-hear-me`](../audio-classifier-hear-me)
 
 ---
@@ -22,11 +22,11 @@
   - Seeded `Kirk - Core Session Phrases (29)` and `Kirk - Full Classifier Lexicon (136)` into `phrase-lists` (`17` total lists) and `phrases` (`7` total sets).
 
 - [x] **Test Coverage (`test_sync.py`, `test_tui.py`)**:
-  - Added 10 unit tests in `TestStageRawSessionsAndHeads` (`36` $\to$ `46` passing tests in `test_sync.py`) and 8 Textual/inspector tests in `test_tui.py`.
+  - Added 10 unit tests in `TestStageRawSessionsAndHeads` (`36` $\to$ `46` passing tests in `test_sync.py`) and 11 TUI/inspector/audio tests in `test_tui.py`.
 
-- [x] **Performant Textual Sync Dashboard (`tui.py`, `sync_inspector.py`, `sync.py --tui`)**:
-  - Added `sync_inspector.py` (`18.5 ms` local scan, `0.04 ms` cached summary, `428 ms` parallel 3-bucket Azure diff).
-  - Built `tui.py` with single clickable `Footer` actions (`check_action`), right-pane `Words` / `Files` / `Sync Diff` tabs, live `/` filter, and `Enter` drill-down (`11.0 ms` switch).
+- [x] **Performant Textual Sync Dashboard & Audio Preview (`tui.py`, `sync_inspector.py`, `audio_preview.py`, `sync.py --tui`)**:
+  - Added `sync_inspector.py` (`15.5 ms` local scan, `0.04 ms` cached summary) and `audio_preview.py` (`0.84 ms` 16k mono / `2.47 ms` 48k stereo waveform).
+  - Built `tui.py` with single clickable `Footer` actions (`check_action`), right-pane `Words` / `Files` / `Sync Diff` tabs, live `/` filter, `Enter` drill-down, and `Space` WAV playback + animated waveform.
   - Excluded `hearme_dashboard.html` and `hearme_powerbi.xlsx` from SWA scans (`sessions` stays `Local: 0`).
   - Added `mtime_ns` pull-to-push parity (`should_upload` checks `.sync_manifest.json`) and `--tui` CLI flag.
 
