@@ -137,6 +137,34 @@
                 "panel": "shared"
             },
             "problemMatcher": []
+        },
+        {
+            "label": "Dashboard: Export HearMe Power BI & HTML",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "export_powerbi.py",
+                "--push-powerbi"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Dashboard: Launch Sync TUI",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "--tui"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
         }
     ]
 }

@@ -8,4 +8,6 @@
 - **Normalized HTTP/XML ETags (`sync.py`)**: Stripped surrounding double quotes in `_normalize_etag()` so incremental `--push` and pull checks match `upload_blob()` and `list_blobs()` ETags.
 - **Added SWA phrase seeding (`sync.py`)**: Added `build_swa_phrase_seeds()` to generate deterministic `PhraseList` and `PhraseSet` JSON payloads from `lexicon.json` and `kirk_core/labels.json`.
 - **Defaulted config to `raw-sessions` (`config.example.json`, `.vscode/tasks.json`)**: Updated default config and build task to sync `raw-sessions` (`./raw-sessions`) while keeping an explicit SWA `sessions` task.
-- **Updated tests, tasks, and docs (`test_sync.py`, `.vscode/tasks.json`, `.gitignore`, `GEMINI.md`, `README.md`, `PROGRESS.md`)**: Added 9 unit tests and configured macOS task entries.
+- **Added Textual sync dashboard (`tui.py`, `sync_inspector.py`, `sync.py`)**: Added `--tui` dashboard with fast `os.scandir()` inspection, parallel Azure bucket diffs, pull-only SWA lock, push confirmation modal, and student quickstart guide.
+- **Added pull-to-push manifest parity (`sync.py`)**: Recorded `mtime_ns` in `.sync_manifest.json` and checked `sync_entry` in `should_upload()` so pulled files stay in sync on push checks.
+- **Updated tests, tasks, and docs (`test_sync.py`, `test_tui.py`, `.vscode/tasks.json`, `.gitignore`, `GEMINI.md`, `README.md`, `PROGRESS.md`, `requirements.txt`)**: Added 10 sync tests, 5 TUI tests, `textual>=8.0.0`, and macOS task entries.

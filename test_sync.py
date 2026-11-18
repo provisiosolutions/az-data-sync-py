@@ -889,5 +889,31 @@ class TestStageRawSessionsAndHeads:
         assert first["phrase_sets"]["kirk-core-phrases.json"]["phrases"] == ["Bless you"]
         assert first["phrase_sets"]["kirk-core-phrases.json"]["phrasesPerSession"] == 1
 
+    def test_should_upload_skips_cleanly_pulled_file_via_sync_manifest(self, tmp_path):
+        f = tmp_path / "all_01.wav"
+        f.write_bytes(b"wav-data")
+        stat = f.stat()
+        sync_entry = {
+            "etag": "0xABCD",
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        stale_push_entry = {
+            "etag": '"0xOLD"',
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns - 1000,
+        }
+        remote_blob = make_blob("all_01.wav", etag="0xABCD", size=stat.st_size)
+
+        assert (
+            should_upload(f, stale_push_entry, remote_blob=remote_blob, sync_entry=sync_entry)
+            is False
+        )
+        remote_blob.etag = "0xCHANGED"
+        assert (
+            should_upload(f, stale_push_entry, remote_blob=remote_blob, sync_entry=sync_entry)
+            is True
+        )
+
 
 

@@ -22,6 +22,7 @@ Usage Scenarios:
 
 import argparse
 import concurrent.futures
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -29,6 +30,7 @@ import os
 import re
 import shutil
 import sys
+from typing import Callable
 import uuid
 import wave
 from datetime import datetime, timezone
@@ -136,6 +138,8 @@ def sync_container(
     max_size_bytes: int = 50 * 1024**3,
     verify_local_files: bool = False,
     strip_prefix: str = "",
+    quiet: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict:
     """
     One-way sync: Azure Blob → local filesystem using concurrent workers.
@@ -198,42 +202,57 @@ def sync_container(
 
         if not local_missing and not should_download(blob, entry):
             log.debug("SKIP  %s  (unchanged)", blob_name)
-            new_manifest[blob_name] = entry  # carry forward
+            if entry is not None and "mtime_ns" not in entry and dest_path.exists():
+                new_manifest[blob_name] = {**entry, "mtime_ns": dest_path.stat().st_mtime_ns}
+            else:
+                new_manifest[blob_name] = entry  # carry forward
             stats["skipped"] += 1
         else:
             to_download.append((blob, entry, dest_path))
 
     if to_download:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task_id = progress.add_task("[cyan]Downloading files...", total=len(to_download))
+        total_items = len(to_download)
+        done_count = 0
+        progress_ctx = (
+            nullcontext(None)
+            if quiet
+            else Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                console=console,
+            )
+        )
+        with progress_ctx as progress:
+            task_id = (
+                progress.add_task("[cyan]Downloading files...", total=total_items)
+                if progress is not None
+                else None
+            )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all download tasks
                 future_to_blob = {
                     executor.submit(
                         _download_blob, container_client, blob.name, dest_path
-                    ): (blob, entry)
+                    ): (blob, entry, dest_path)
                     for blob, entry, dest_path in to_download
                 }
 
                 # Handle results as they complete
                 for future in concurrent.futures.as_completed(future_to_blob):
-                    blob, entry = future_to_blob[future]
+                    blob, entry, dest_path = future_to_blob[future]
                     blob_name = blob.name
-                    
+
                     try:
                         future.result()  # Will raise if _download_blob threw an exception
                         new_manifest[blob_name] = {
                             "etag": blob.etag,
                             "last_modified": blob.last_modified.isoformat() if blob.last_modified else None,
                             "size": blob.size,
+                            "mtime_ns": dest_path.stat().st_mtime_ns if dest_path.exists() else None,
                             "synced_at": datetime.now(timezone.utc).isoformat(),
                         }
                         stats["downloaded"] += 1
@@ -243,8 +262,12 @@ def sync_container(
                         if entry:
                             new_manifest[blob_name] = entry
                         stats["errors"] += 1
-                    
-                    progress.advance(task_id)
+
+                    done_count += 1
+                    if progress is not None and task_id is not None:
+                        progress.advance(task_id)
+                    if progress_callback is not None:
+                        progress_callback(done_count, total_items, blob_name)
 
     # Optionally remove local files that no longer exist in the container
     if delete_orphaned:
@@ -266,7 +289,12 @@ def sync_container(
 # Upload / Push & HearMe Classifier Artifact Backup
 # ---------------------------------------------------------------------------
 
-def should_upload(local_path: Path, push_entry: dict | None, remote_blob=None) -> bool:
+def should_upload(
+    local_path: Path,
+    push_entry: dict | None,
+    remote_blob=None,
+    sync_entry: dict | None = None,
+) -> bool:
     """Decide whether a local file needs to be uploaded to Azure Blob Storage."""
     stat = local_path.stat()
     if push_entry is not None:
@@ -277,6 +305,16 @@ def should_upload(local_path: Path, push_entry: dict | None, remote_blob=None) -
             saved_etag = _normalize_etag(push_entry.get("etag"))
             remote_etag = _normalize_etag(getattr(remote_blob, "etag", None))
             if remote_blob is None or not saved_etag or remote_etag == saved_etag:
+                return False
+
+    if sync_entry is not None and remote_blob is not None:
+        sync_mtime_ns = sync_entry.get("mtime_ns")
+        if sync_entry.get("size") == stat.st_size and (
+            sync_mtime_ns is None or sync_mtime_ns == stat.st_mtime_ns
+        ):
+            saved_sync_etag = _normalize_etag(sync_entry.get("etag"))
+            remote_etag = _normalize_etag(getattr(remote_blob, "etag", None))
+            if saved_sync_etag and remote_etag == saved_sync_etag:
                 return False
 
     if remote_blob is not None and push_entry is None:
@@ -307,6 +345,8 @@ def push_directory(
     max_workers: int = 8,
     max_size_bytes: int = 50 * 1024**3,
     dry_run: bool = False,
+    quiet: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict:
     """
     One-way push: local directory → Azure Blob Storage using concurrent workers.
@@ -322,6 +362,7 @@ def push_directory(
         norm_prefix += "/"
 
     manifest = load_manifest(local_dir, PUSH_MANIFEST_FILE)
+    sync_manifest = load_manifest(local_dir, MANIFEST_FILE)
     new_manifest = dict(manifest)
 
     remote_blobs: dict[str, object] = {}
@@ -359,9 +400,10 @@ def push_directory(
                 continue
 
             entry = manifest.get(blob_name)
+            sync_entry = sync_manifest.get(blob_name)
             remote_blob = remote_blobs.get(blob_name)
 
-            if not should_upload(fpath, entry, remote_blob=remote_blob):
+            if not should_upload(fpath, entry, remote_blob=remote_blob, sync_entry=sync_entry):
                 if entry is None and remote_blob is not None:
                     new_manifest[blob_name] = {
                         "size": fstat.st_size,
@@ -394,15 +436,26 @@ def push_directory(
         except Exception as exc:
             log.debug("Container create skipped or already exists (%s).", exc)
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task_id = progress.add_task("[cyan]Uploading files...", total=len(to_upload))
+        total_items = len(to_upload)
+        done_count = 0
+        progress_ctx = (
+            nullcontext(None)
+            if quiet
+            else Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                console=console,
+            )
+        )
+        with progress_ctx as progress:
+            task_id = (
+                progress.add_task("[cyan]Uploading files...", total=total_items)
+                if progress is not None
+                else None
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_item = {
                     executor.submit(_upload_blob, container_client, blob_name, fpath): (
@@ -429,7 +482,11 @@ def push_directory(
                         if entry:
                             new_manifest[blob_name] = entry
                         stats["errors"] += 1
-                    progress.advance(task_id)
+                    done_count += 1
+                    if progress is not None and task_id is not None:
+                        progress.advance(task_id)
+                    if progress_callback is not None:
+                        progress_callback(done_count, total_items, blob_name)
 
     if delete_orphaned:
         for k in list(new_manifest):
@@ -1183,6 +1240,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug-level logging for detailed troubleshooting.",
     )
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the interactive Textual terminal dashboard.",
+    )
     return p
 
 
@@ -1192,6 +1254,17 @@ def main() -> None:
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.tui:
+        from tui import run_tui
+
+        run_tui(
+            config_path=Path(args.config) if args.config else Path("config.json"),
+            classifier_root=args.classifier_root
+            or args.stage_from_classifier
+            or Path("../audio-classifier-hear-me"),
+        )
+        return
 
     if (
         args.stage_from_classifier is not None

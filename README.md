@@ -124,6 +124,21 @@ python sync.py -c config.json --local-dir /data/backup
 | `--skip-exports` | | `false` | Skip heavy Core ML / ONNX export bundles when syncing `--classifier-root` |
 | `--dry-run` | | `false` | Preview files to upload without transferring data |
 | `--verbose` | `-v` | `false` | Enable debug-level logging |
+| `--tui` | | `false` | Launch the interactive Textual sync dashboard |
+
+## Student TUI Quickstart (`tui.py` / `--tui`)
+
+Launch the interactive dashboard to inspect datasets, preview diffs, and sync buckets without long CLI flags:
+
+```bash
+python sync.py --tui
+# Or run directly:
+python tui.py
+```
+
+1. **Copy Config:** Run `cp config.example.json config.json` and paste your Azure connection string.
+2. **Pick a Bucket:** Press `Up` or `Down` to highlight `raw-sessions`, `trained-heads`, or `sessions (SWA)`.
+3. **Sync Safely:** Press `G` to pull files, `S` to stage new clips from `../audio-classifier-hear-me`, `P` to confirm and push, or `?` to open the Python/Pandas quickstart guide. (`sessions` stays Pull-Only.)
 
 ## Three-Bucket Session & Trained-Head Layout
 
@@ -198,7 +213,7 @@ The manifest is stored inside your `--local-dir`. Deleting it will cause a full 
 
 ```bash
 pip install pytest
-pytest test_sync.py -v
+pytest test_sync.py test_tui.py -v
 ```
 
 All Azure SDK calls are mocked — no real Azure connection needed.
