@@ -1,34 +1,32 @@
-# PROGRESS — Azure Blob Sync & HearMe Classifier Bridge (`az-data-sync-py`)
+# PROGRESS — Azure Blob Sync & HearMe Three-Bucket Bridge (`az-data-sync-py`)
 
-> **Active Sprint Window**: Recursive Session Discovery, HearMe Classifier Export & Two-Way Artifact Sync  
-> **Session Status**: ✅ **ACTIVE** (`2026-11-02T15:43-05:00`)  
-> **Branch & Base SHA**: `main` (`603d273`)  
-> **Environment Health**: 36/36 Pytest unit & integration tests passing in `0.46s` (`test_sync.py`)  
+> **Active Sprint Window**: Separate SWA Sessions, Raw Kirk Sessions, and Trained Heads  
+> **Session Status**: ✅ **READY FOR HANDOFF** (`2026-11-18T16:05-05:00`)  
+> **Branch & Base SHA**: `feat/three-bucket-snake-case-sync` (from `6afb708`)  
+> **Environment Health**: 45/45 Pytest unit tests passing (`test_sync.py`)  
 > **Connected Repository**: [`../audio-classifier-hear-me`](../audio-classifier-hear-me)
 
 ---
 
-## 🏁 Completed in this Session (2026-11-02)
+## 1. Completed in This Session (2026-11-18)
 
-- [x] **Recursive Session Discovery & Disk Fallback (`review_sessions.py`)**:
-  - Updated `discover_sessions()` to scan `rglob("metadata.json")` across legacy `{guid}/`, standalone `{friendlyName}/`, and nested `{sessionCode}/{friendlyName}/` directories without failing when `synced-files/` is absent.
-  - Added `session_code` badge rendering in `_render_session_card()` and on-disk `.wav` fallback discovery when `.sync_manifest.json` is missing or partial.
-  - Replaced `this.innerHTML` in `templates/review.html` (`<audio-player>`) with `document.createElement('audio')` and `this.replaceChildren(audio)`.
+- [x] **Three-Bucket Isolation (`sync.py`, `.gitignore`, `.vscode/tasks.json`, `config.example.json`)**:
+  - Added `stage_classifier_raw_sessions()`, `stage_trained_heads()`, `to_snake_case()`, `parse_raw_clip_stem()`, and `build_swa_phrase_seeds()`.
+  - Enforced strict `snake_case` paths (`session_2026_08_25`, `session_2026_09_25`, `session_2026_11_18_edited_clips`) with self-contained `manifest.jsonl` (`578` rows) and `lexicon.json` (`137` phrases).
+  - Added live-only `create_container()`, `_normalize_etag()`, and `--delete-orphaned` support in `push_directory()`.
+  - Defaulted `config.json` and `config.example.json` to `raw-sessions` (`./raw-sessions`).
 
-- [x] **HearMe Classifier Canonical Export Bridge (`review_sessions.py`)**:
-  - Added `canonicalize_phrase_id()` and `export_sessions_for_classifier()` (`--export-classifier <dir>`, `--include-bad`) to export valid session recordings into `<canonical_label>/<session_slug>_<phrase_id>.wav` and `export_manifest.jsonl`.
+- [x] **Azure Sync, QA Cleanup & SWA Seed (`rghearmeappafc6`)**:
+  - Synced `raw-sessions` (`583` `snake_case` blobs) and `trained-heads` (`18` blobs).
+  - Archived `994` QA blobs (`961` `sessions`, `30` `phrases`, `3` `QA Test List`) into `qa-archive` and deleted local `synced-files/`.
+  - Seeded `Kirk - Core Session Phrases (29)` and `Kirk - Full Classifier Lexicon (136)` into `phrase-lists` (`17` total lists) and `phrases` (`7` total sets).
 
-- [x] **Prefix-Safe Sync, Missing File Recovery & Classifier Artifact Backup (`sync.py`)**:
-  - Preserved out-of-prefix `.sync_manifest.json` entries during `--prefix` runs so partial syncs never wipe unrelated manifest keys or delete unrelated local files under `--delete-orphaned`.
-  - Added `--verify-local` (`verify_local_files=True`) to re-download blobs that are missing on disk even when manifest ETags match.
-  - Added `push_directory()` and `sync_classifier_artifacts()` (`--push`, `--classifier-root`, `--skip-exports`, `--dry-run`) to push and pull `audio-classifier-hear-me` datasets (`dataset/`), speaker heads (`profiles/`), and model weights (`results/best_model/`, Core ML, ONNX) under the `classifier/` prefix while skipping symlinks (`profiles/kirk/audio_data -> ../../dataset/train`).
-
-- [x] **Expanded Test Suite (`test_sync.py`)**:
-  - Added 10 new unit tests (`26` $\to$ `36` passing tests) covering recursive 3-format session discovery, disk WAV fallback, DOM safety, canonical classifier export, prefix-safe manifest retention, `--verify-local`, and `sync_classifier_artifacts()` push/pull round-trips.
+- [x] **Test Coverage (`test_sync.py`)**:
+  - Added 9 unit tests in `TestStageRawSessionsAndHeads` (`36` $\to$ `45` passing tests).
 
 ---
 
-## 🎯 Immediate Next Steps
+## 2. Next Steps
 
-1. **Commit & Push `az-data-sync-py`**: Stage and commit `sync.py`, `review_sessions.py`, `templates/review.html`, `test_sync.py`, `README.md`, `GEMINI.md`, and `PROGRESS.md` when ready to publish.
-2. **Run Classifier Backup to Azure Blob Storage**: Execute `python sync.py -c config.json --push --classifier-root ../audio-classifier-hear-me` once `config.json` (or `AZURE_STORAGE_CONNECTION_STRING`) is configured.
+1. Re-stage and push `trained-heads/` (and back up `best_model` / `best_model_core`) after active Colab GPU training finishes.
+2. Push `feat/three-bucket-snake-case-sync` and open a PR when ready.

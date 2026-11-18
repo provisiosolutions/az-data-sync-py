@@ -2,9 +2,9 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Sync: Retrieve Latest Files",
+            "label": "Sync: Pull Raw Sessions",
             "type": "shell",
-            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "command": "${workspaceFolder}/.venv/bin/python",
             "args": [
                 "sync.py",
                 "--config",
@@ -14,6 +14,124 @@
                 "kind": "build",
                 "isDefault": true
             },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Sync: Pull SWA Sessions",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "-c",
+                "config.json",
+                "--container",
+                "sessions",
+                "--local-dir",
+                "./synced-files"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Stage: Raw Sessions & Trained Heads",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "--stage-from-classifier",
+                "../audio-classifier-hear-me"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Dry-Run Push: Raw Sessions",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "-c",
+                "config.json",
+                "--container",
+                "raw-sessions",
+                "--local-dir",
+                "./raw-sessions",
+                "--push",
+                "--delete-orphaned",
+                "--dry-run"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Dry-Run Push: Trained Heads",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "-c",
+                "config.json",
+                "--container",
+                "trained-heads",
+                "--local-dir",
+                "./trained-heads",
+                "--push",
+                "--dry-run"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Live Push: Raw Sessions",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "-c",
+                "config.json",
+                "--container",
+                "raw-sessions",
+                "--local-dir",
+                "./raw-sessions",
+                "--push",
+                "--delete-orphaned"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Live Push: Trained Heads",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "sync.py",
+                "-c",
+                "config.json",
+                "--container",
+                "trained-heads",
+                "--local-dir",
+                "./trained-heads",
+                "--push"
+            ],
             "presentation": {
                 "reveal": "always",
                 "panel": "shared"

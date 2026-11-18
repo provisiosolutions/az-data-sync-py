@@ -2,15 +2,21 @@
 
 ## 🧠 Persistent Memory (MemPalace)
 This project uses MemPalace for long-term memory.
-- **Mining:** Before starting a complex task, run `mempalace mine .` to ensure the palace is up to date.
-- **Context:** If you need to know "why" a decision was made or find past snippets, use the `mempalace` MCP tools to search the 'technical' or 'palace' halls.
-- **Session Sync:** I regularly mine my Antigravity session logs; if you lack context from our last chat, search the `chats` wing.
+- **Mining:** Run `mempalace mine .` before a complex task to keep the palace current.
+- **Context:** Use `mempalace` MCP tools to search the `technical` or `palace` halls for past decisions.
+- **Session Sync:** Search the `chats` wing when you need context from earlier sessions.
 
-## 📂 Naming Conventions & Folder Structure
-- **Azure Blob Storage Paths**:
-  - Legacy sessions are stored under raw GUID folders (e.g. `b40f28e2-8926-48d6-9e45-7e8cabf8e1ad/`).
-  - Modern sessions are stored under `{sessionCode}/{friendlyName}/` (if a 4-char session code is provided) or simply `{friendlyName}/` where `friendlyName` is deterministically generated in the format `{date}-{adjective}-{noun}` from the session GUID (see `SessionNameService.cs` in the backend).
-- **Sync Tool Mapping**:
-  - `sync.py` mirrors the remote container structure. Thus, files are downloaded into `synced-files/{sessionCode}/{friendlyName}/`, `synced-files/{friendlyName}/`, or `synced-files/{guid}/`.
-- **Review Session Page**:
-  - `review_sessions.py` generates `review.html`. It must scan recursively to find `metadata.json` files and correctly associate WAV files with their parent folder name, supporting legacy GUIDs, standalone friendly names, and nested `{sessionCode}/{friendlyName}/` folders.
+## 📂 Three-Bucket Folder & Container Map
+This repository separates HearMe SWA sessions, direct raw audio sessions, and trained speaker heads into three buckets:
+
+| Local Directory | Azure Container | Direction | Contents |
+| :--- | :--- | :--- | :--- |
+| `synced-files/` | `sessions` | Pull only | HearMe SWA sessions (`{guid}/`, `{friendlyName}/`, `{sessionCode}/{friendlyName}/`) |
+| `raw-sessions/` | `raw-sessions` | Stage & push/pull | `snake_case` Kirk WAV sessions (`session_2026_08_25/`, `session_2026_09_25/`, `session_2026_11_18_edited_clips/`), `manifest.jsonl`, `lexicon.json` |
+| `trained-heads/` | `trained-heads` | Stage & push/pull | Trained speaker heads (`kirk/`, `kirk_core/`) without symlinked `audio_data/` |
+
+## 📂 Naming & Review Rules
+- **Default Config Bucket:** `config.json` points to `raw-sessions` (`./raw-sessions/`). Pass `--container sessions --local-dir ./synced-files` to pull SWA sessions.
+- **Azure SWA Paths:** Legacy SWA sessions use raw GUID folders. Modern SWA sessions use `{sessionCode}/{friendlyName}/` or `{friendlyName}/`.
+- **Sync Tool Mapping:** `sync.py` mirrors each remote container into its local bucket directory.
+- **Review Session Page:** `review_sessions.py` scans `synced-files/` recursively for `metadata.json` files and builds `review.html` for all three SWA folder shapes.
